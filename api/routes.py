@@ -30,29 +30,34 @@ async def create_investigation(
         slug = base_slug if attempt == 0 else f"{base_slug}-{attempt}"
 
         try:
-            # Create investigation
-            investigation = Investigation(
-                topic=data.topic, slug=slug, status="active", current_stage="research"
-            )
-            db.add(investigation)
-            await db.flush()
-
-            # Create stage rows
-            for i, stage in enumerate(STAGES):
-                stage_obj = Stage(
-                    investigation_id=investigation.id,
-                    stage=stage,
-                    status="active" if i == 0 else "pending",
+            # Use savepoint to keep session clean on rollback
+            async with db.begin_nested():
+                # Create investigation
+                investigation = Investigation(
+                    topic=data.topic, slug=slug, status="active", current_stage="research"
                 )
-                db.add(stage_obj)
+                db.add(investigation)
+                await db.flush()
 
+                # Create stage rows
+                for i, stage in enumerate(STAGES):
+                    stage_obj = Stage(
+                        investigation_id=investigation.id,
+                        stage=stage,
+                        status="active" if i == 0 else "pending",
+                    )
+                    db.add(stage_obj)
+
+            # Savepoint committed, now commit transaction
             await db.commit()
             await db.refresh(investigation)
             return investigation
 
         except IntegrityError as e:
             await db.rollback()
-            if "slug" in str(e.orig) and attempt < max_attempts - 1:
+            # Check for unique constraint violation (PostgreSQL SQLSTATE 23505)
+            is_unique_violation = getattr(e.orig, "sqlstate", None) == "23505"
+            if is_unique_violation and attempt < max_attempts - 1:
                 continue  # Try next slug
             raise HTTPException(status_code=409, detail="Could not generate unique slug") from e
 
