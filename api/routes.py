@@ -5,6 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from slugify import slugify
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_app_db
@@ -22,36 +23,38 @@ async def create_investigation(
 ):
     # Generate slug from topic
     base_slug = slugify(data.topic, max_length=100)
-    slug = base_slug
 
-    # Ensure unique slug
-    counter = 1
-    while True:
-        result = await db.execute(select(Investigation).where(Investigation.slug == slug))
-        if not result.scalar():
-            break
-        slug = f"{base_slug}-{counter}"
-        counter += 1
+    # Retry with incremented counter if slug collision (handles race condition)
+    max_attempts = 10
+    for attempt in range(max_attempts):
+        slug = base_slug if attempt == 0 else f"{base_slug}-{attempt}"
 
-    # Create investigation
-    investigation = Investigation(
-        topic=data.topic, slug=slug, status="active", current_stage="research"
-    )
-    db.add(investigation)
-    await db.flush()
+        try:
+            # Create investigation
+            investigation = Investigation(
+                topic=data.topic, slug=slug, status="active", current_stage="research"
+            )
+            db.add(investigation)
+            await db.flush()
 
-    # Create stage rows
-    for i, stage in enumerate(STAGES):
-        stage_obj = Stage(
-            investigation_id=investigation.id,
-            stage=stage,
-            status="active" if i == 0 else "pending",
-        )
-        db.add(stage_obj)
+            # Create stage rows
+            for i, stage in enumerate(STAGES):
+                stage_obj = Stage(
+                    investigation_id=investigation.id,
+                    stage=stage,
+                    status="active" if i == 0 else "pending",
+                )
+                db.add(stage_obj)
 
-    await db.commit()
-    await db.refresh(investigation)
-    return investigation
+            await db.commit()
+            await db.refresh(investigation)
+            return investigation
+
+        except IntegrityError as e:
+            await db.rollback()
+            if "slug" in str(e.orig) and attempt < max_attempts - 1:
+                continue  # Try next slug
+            raise HTTPException(status_code=409, detail="Could not generate unique slug") from e
 
 
 @router.get("/investigations", response_model=list[InvestigationResponse])

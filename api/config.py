@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings
 
 def _normalize_async_url(url: str) -> str:
     """Rewrite postgres:// and postgresql:// to postgresql+asyncpg://."""
+    if url.startswith("postgresql+asyncpg://"):
+        return url  # already correct
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+asyncpg://", 1)
     if url.startswith("postgresql://"):
