@@ -32,7 +32,7 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 | `api/orchestrator.py` | State machine, gate logic (approve/revise/reject), snapshots, cost logging |
 | `api/executor.py` | Agent loop (async generator), streaming, tool dispatch, structured extraction |
 | `api/research.py` | Research agent config: system prompt (3 cached blocks), DossierOutput schema, kickoff message |
-| `api/tools.py` | DB search tools (search_initiatives, search_votes, search_deputies, raw_query, request_gate_review) |
+| `api/tools.py` | DB tools (search_initiatives, search_votes, search_deputies, describe_table, raw_query, request_gate_review) |
 | `api/ws.py` | WebSocket endpoint `/ws/chat/{id}`: message handling, gate decisions, agent orchestration |
 | `api/costs.py` | Anthropic pricing table, cost calculation with cache pricing |
 | `api/tracing.py` | Langfuse TraceContext: span/generation/tool call logging |

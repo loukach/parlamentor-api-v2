@@ -1,6 +1,7 @@
 """DB search tools for the research agent.
 
-5 tools: search_initiatives, search_votes, search_deputies, raw_query, request_gate_review.
+6 tools: search_initiatives, search_votes, search_deputies, describe_table,
+raw_query, request_gate_review.
 All typed tools generate SQL internally (agent never writes SQL for these).
 """
 
@@ -19,6 +20,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_LEGISLATURE = "XVII"
 DEFAULT_LIMIT = 30
 MAX_LIMIT = 100
+
+PARLA_TABLES = frozenset({
+    "iniciativas", "iniciativa_events", "votes", "deputados",
+    "intervencoes", "speech_transcripts", "iniciativa_autores", "iniciativa_comissao",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +138,34 @@ TOOL_DEFINITIONS: dict[str, dict] = {
             "additionalProperties": False,
         },
     },
+    "describe_table": {
+        "name": "describe_table",
+        "description": (
+            "Get the column names and types for a parliamentary database table. "
+            "Call this BEFORE writing raw_query SQL to avoid column-name errors. "
+            "Available tables: iniciativas, iniciativa_events, votes, deputados, "
+            "intervencoes, speech_transcripts, iniciativa_autores, iniciativa_comissao."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_name": {
+                    "type": "string",
+                    "description": "Table name to describe.",
+                    "enum": sorted(PARLA_TABLES),
+                },
+            },
+            "required": ["table_name"],
+            "additionalProperties": False,
+        },
+    },
     "raw_query": {
         "name": "raw_query",
         "description": (
             "Execute a read-only SQL query against the parliamentary database. "
             "Use this as an escape hatch when the typed search tools don't cover your needs. "
-            "The database contains tables: iniciativas, iniciativa_events, votes, deputados, "
-            "intervencoes, speech_transcripts, iniciativa_autores, iniciativa_comissao. "
-            "IMPORTANT: Child table FKs point to iniciativas.id (integer), NOT ini_id (string)."
+            "IMPORTANT: Call describe_table first to check column names. "
+            "Child table FKs point to iniciativas.id (integer), NOT ini_id (string)."
         ),
         "input_schema": {
             "type": "object",
@@ -432,6 +458,38 @@ async def handle_search_deputies(
     return {"results": data, "count": len(data), "query_description": "Searched deputies"}
 
 
+async def handle_describe_table(
+    params: dict,
+    parla_db: AsyncSession,
+    app_db: AsyncSession,
+    investigation_id: uuid.UUID,
+    stage: str,
+) -> dict:
+    table_name = params.get("table_name", "")
+    if table_name not in PARLA_TABLES:
+        return {"error": f"Unknown table: {table_name}. Valid: {', '.join(sorted(PARLA_TABLES))}"}
+
+    sql = """
+        SELECT column_name, data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = :table
+        ORDER BY ordinal_position
+    """
+    t0 = time.monotonic()
+    result = await parla_db.execute(text(sql), {"table": table_name})
+    rows = result.mappings().all()
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    columns = [
+        {"column": r["column_name"], "type": r["data_type"], "nullable": r["is_nullable"] == "YES"}
+        for r in rows
+    ]
+
+    await _log_query(app_db, investigation_id, stage, "describe_table", params, sql, len(columns), duration_ms)
+
+    return {"table": table_name, "columns": columns, "count": len(columns)}
+
+
 async def handle_raw_query(
     params: dict,
     parla_db: AsyncSession,
@@ -515,6 +573,7 @@ def build_tool_registry(
         TOOL_DEFINITIONS["search_initiatives"],
         TOOL_DEFINITIONS["search_votes"],
         TOOL_DEFINITIONS["search_deputies"],
+        TOOL_DEFINITIONS["describe_table"],
         TOOL_DEFINITIONS["raw_query"],
         TOOL_DEFINITIONS["request_gate_review"],
     ]
@@ -531,6 +590,10 @@ def build_tool_registry(
         async with parla_session_factory() as parla_db:
             return await handle_search_deputies(params, parla_db, app_db, investigation_id, stage)
 
+    async def _describe_table(params: dict) -> dict:
+        async with parla_session_factory() as parla_db:
+            return await handle_describe_table(params, parla_db, app_db, investigation_id, stage)
+
     async def _raw_query(params: dict) -> dict:
         async with parla_session_factory() as parla_db:
             return await handle_raw_query(params, parla_db, app_db, investigation_id, stage)
@@ -542,6 +605,7 @@ def build_tool_registry(
         "search_initiatives": _search_initiatives,
         "search_votes": _search_votes,
         "search_deputies": _search_deputies,
+        "describe_table": _describe_table,
         "raw_query": _raw_query,
         "request_gate_review": _request_gate_review,
     }

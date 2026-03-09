@@ -320,6 +320,9 @@ def _tool_summary(tool_name: str, tool_input: dict) -> str:
             parts.append(f"partido: {tool_input['party']}")
         return f"A pesquisar deputados ({', '.join(parts)})" if parts else "A pesquisar deputados"
 
+    if tool_name == "describe_table":
+        return f"A consultar esquema: {tool_input.get('table_name', '?')}"
+
     if tool_name == "raw_query":
         return f"Query SQL: {tool_input.get('description', 'custom query')}"
 
@@ -336,6 +339,10 @@ def _result_summary(tool_name: str, result_data: dict) -> str:
 
     count = result_data.get("count", 0)
     desc = result_data.get("query_description", "")
+
+    if tool_name == "describe_table":
+        table = result_data.get("table", "")
+        return f"{count} coluna(s) - {table}"
 
     if tool_name == "request_gate_review":
         return "Revisao solicitada"
