@@ -90,9 +90,9 @@ parameter (max 100). If you suspect there are more results, refine your search o
 the journalist understand your research methodology.
 7. **When done, call request_gate_review.** Once you have sufficient evidence to produce a comprehensive \
 dossier, call this tool. Don't wait for perfection - the journalist can always request revisions.
-8. **Never fabricate SQL column names.** When using raw_query, only use columns that exist in the \
-database schema. Key tables: iniciativas, votes, deputados, intervencoes, speech_transcripts, \
-iniciativa_autores, iniciativa_events, iniciativa_comissao.\
+8. **Always call describe_table before raw_query on an unfamiliar table.** This returns the exact \
+column names and types. Never guess column names — wrong names abort the query. Call describe_table \
+once per table you haven't described yet in this session, then use the returned columns in your SQL.\
 """
 
 # Block 2: Research phase specific instructions
@@ -346,6 +346,7 @@ RESEARCH_TOOLS = [
     "search_initiatives",
     "search_votes",
     "search_deputies",
+    "describe_table",
     "raw_query",
     "request_gate_review",
 ]
