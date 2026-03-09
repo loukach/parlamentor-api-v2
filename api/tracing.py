@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _langfuse = None
 
 
-def _get_langfuse():
+def get_langfuse():
     """Lazy-init Langfuse client (reuses the one from main.py if available)."""
     global _langfuse
     if _langfuse is not None:
@@ -37,16 +37,18 @@ class TraceContext:
         self.investigation_id = investigation_id
         self.stage = stage
         self._span = None
-        self._langfuse = _get_langfuse()
+        self._langfuse = get_langfuse()
 
         if self._langfuse:
             try:
                 self._span = self._langfuse.start_span(
                     name=f"{stage}: {user_message[:60]}",
+                    input=user_message,
                     metadata={"stage": stage},
                 )
                 self._span.update_trace(
                     session_id=str(investigation_id),
+                    input=user_message,
                 )
             except Exception:
                 logger.exception("Failed to start Langfuse span")
@@ -117,11 +119,14 @@ class TraceContext:
         except Exception:
             logger.exception("Failed to log gate decision to Langfuse")
 
-    def end(self) -> None:
+    def end(self, output: str | None = None) -> None:
         """End the trace span and flush."""
         if not self._span:
             return
         try:
+            if output:
+                self._span.update(output=output[:2000])
+                self._span.update_trace(output=output[:500])
             self._span.end()
             if self._langfuse:
                 self._langfuse.flush()

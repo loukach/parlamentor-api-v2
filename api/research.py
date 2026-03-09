@@ -4,15 +4,32 @@ System prompt has 3 blocks:
 - Block 1 (cached): Identity + data rules + parliamentary knowledge + tool rules
 - Block 2 (cached): Research phase instructions
 - Block 3 (dynamic): Investigation topic + revision feedback
+
+Blocks 1, 2, and the extraction prompt are fetched from Langfuse (production label)
+with hardcoded fallbacks if Langfuse is unavailable.
 """
 
+import logging
+
+from api.tracing import get_langfuse
+
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
-# System prompt blocks
+# Langfuse prompt names
+# ---------------------------------------------------------------------------
+
+_PROMPT_IDENTITY = "parlamentor-v2-research-identity"
+_PROMPT_INSTRUCTIONS = "parlamentor-v2-research-instructions"
+_PROMPT_EXTRACTION = "parlamentor-v2-research-extraction"
+
+# ---------------------------------------------------------------------------
+# Hardcoded fallbacks (used when Langfuse is unavailable)
 # ---------------------------------------------------------------------------
 
 # Block 1: Identity, data rules, parliamentary knowledge, tool rules
 # Must be >= 1024 tokens for caching. Marked with cache_control.
-_BLOCK_1_IDENTITY = """\
+_FALLBACK_IDENTITY = """\
 You are Parlamentor, an AI research agent specialized in investigating the Portuguese parliament \
 (Assembleia da Republica). You assist investigative journalists by autonomously querying \
 parliamentary databases and producing structured, evidence-based research dossiers.
@@ -97,7 +114,7 @@ once per table you haven't described yet in this session, then use the returned 
 
 # Block 2: Research phase specific instructions
 # Must be >= 1024 tokens for caching. Marked with cache_control.
-_BLOCK_2_RESEARCH = """\
+_FALLBACK_INSTRUCTIONS = """\
 ## Research Phase Instructions
 
 You are in the **Research** phase. Your goal is to produce a comprehensive research dossier \
@@ -196,6 +213,24 @@ Ensure your research is thorough enough to populate all these fields meaningfull
 """
 
 
+def _fetch_prompt(name: str) -> str | None:
+    """Fetch prompt text from Langfuse. Returns None if unavailable."""
+    lf = get_langfuse()
+    if not lf:
+        return None
+    try:
+        prompt = lf.get_prompt(name, label="production")
+        return prompt.compile()
+    except Exception:
+        logger.warning("Langfuse prompt '%s' unavailable, using fallback", name)
+        return None
+
+
+def get_extraction_prompt() -> str:
+    """Return the extraction prompt, fetching from Langfuse with fallback."""
+    return _fetch_prompt(_PROMPT_EXTRACTION) or _FALLBACK_EXTRACTION
+
+
 async def build_research_prompt(
     topic: str,
     feedback: str | None = None,
@@ -205,18 +240,24 @@ async def build_research_prompt(
     Returns list of content blocks with cache_control markers.
     Block 1 + Block 2 are cached (>= 1024 tokens each).
     Block 3 is dynamic (topic + feedback).
+
+    Prompt text is fetched from Langfuse (production label) with
+    hardcoded fallbacks if Langfuse is unavailable.
     """
+    identity = _fetch_prompt(_PROMPT_IDENTITY) or _FALLBACK_IDENTITY
+    instructions = _fetch_prompt(_PROMPT_INSTRUCTIONS) or _FALLBACK_INSTRUCTIONS
+
     blocks = [
         # Block 1: Identity + rules (cached)
         {
             "type": "text",
-            "text": _BLOCK_1_IDENTITY,
+            "text": identity,
             "cache_control": {"type": "ephemeral"},
         },
         # Block 2: Research instructions (cached)
         {
             "type": "text",
-            "text": _BLOCK_2_RESEARCH,
+            "text": instructions,
             "cache_control": {"type": "ephemeral"},
         },
     ]
@@ -334,7 +375,7 @@ DOSSIER_SCHEMA = {
     },
 }
 
-EXTRACTION_PROMPT = (
+_FALLBACK_EXTRACTION = (
     "Based on the research conversation above, extract a structured dossier "
     "with all findings. Include every relevant initiative found, all observed "
     "patterns, voting dynamics, data gaps, and recommended next steps. "

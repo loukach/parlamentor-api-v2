@@ -28,8 +28,8 @@ from api.orchestrator import (
 )
 from api.research import (
     DOSSIER_SCHEMA,
-    EXTRACTION_PROMPT,
     build_research_prompt,
+    get_extraction_prompt,
 )
 from api.tools import build_tool_registry
 from api.tracing import TraceContext
@@ -139,6 +139,7 @@ async def _handle_message(
 ) -> None:
     """Handle a user message: persist, build prompt, run agent, stream results."""
     trace = TraceContext(str(investigation_id), "research", content)
+    assistant_text = ""
 
     try:
         async with app_session_factory() as app_db:
@@ -187,7 +188,6 @@ async def _handle_message(
                     pass  # User message already in history
 
                 # Run agent
-                assistant_text = ""
                 gate_requested = False
                 total_usage = {
                     "input_tokens": 0,
@@ -306,7 +306,7 @@ async def _handle_message(
         await _send(websocket, {"type": "error", "content": "Error processing message"})
         await _send(websocket, {"type": "turn_complete"})
     finally:
-        trace.end()
+        trace.end(output=assistant_text)
 
 
 async def _run_gate_extraction(
@@ -322,7 +322,7 @@ async def _run_gate_extraction(
             model=model,
             messages=messages,
             schema=DOSSIER_SCHEMA,
-            extraction_prompt=EXTRACTION_PROMPT,
+            extraction_prompt=get_extraction_prompt(),
         )
 
         # Save output to DB
