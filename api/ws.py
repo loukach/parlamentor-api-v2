@@ -140,6 +140,7 @@ async def _handle_message(
     """Handle a user message: persist, build prompt, run agent, stream results."""
     trace = TraceContext(str(investigation_id), "research", content)
     assistant_text = ""
+    trace_output = ""  # Will hold dossier summary if extraction runs
 
     try:
         async with app_session_factory() as app_db:
@@ -287,9 +288,9 @@ async def _handle_message(
 
                 # If gate review was requested, run extraction
                 if gate_requested:
-                    await _run_gate_extraction(
+                    trace_output = await _run_gate_extraction(
                         websocket, investigation_id, current_stage, model, messages
-                    )
+                    ) or ""
 
         else:
             # Placeholder for other stages — just echo back
@@ -306,7 +307,7 @@ async def _handle_message(
         await _send(websocket, {"type": "error", "content": "Error processing message"})
         await _send(websocket, {"type": "turn_complete"})
     finally:
-        trace.end(output=assistant_text)
+        trace.end(output=trace_output or assistant_text)
 
 
 async def _run_gate_extraction(
@@ -315,8 +316,11 @@ async def _run_gate_extraction(
     stage: str,
     model: str,
     messages: list[dict],
-) -> None:
-    """Run structured extraction after request_gate_review and send results."""
+) -> str | None:
+    """Run structured extraction after request_gate_review and send results.
+
+    Returns the executive_summary for trace output, or None on failure.
+    """
     try:
         parsed_output, extraction_usage = await run_extraction(
             model=model,
@@ -365,12 +369,15 @@ async def _run_gate_extraction(
             "iteration": 0,
         })
 
+        return parsed_output.get("executive_summary", "")
+
     except Exception:
         logger.exception("Extraction failed for %s/%s", investigation_id, stage)
         await _send(websocket, {
             "type": "error",
             "content": "Failed to extract structured dossier. The agent's research is preserved — try again.",
         })
+        return None
 
 
 async def _handle_gate_decision(
