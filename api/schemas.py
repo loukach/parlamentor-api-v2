@@ -34,6 +34,18 @@ class StageResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class MessageResponse(BaseModel):
+    id: uuid.UUID
+    investigation_id: uuid.UUID
+    stage: str
+    role: str
+    content: str
+    metadata_: dict | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class StageOutputResponse(BaseModel):
     id: uuid.UUID
     investigation_id: uuid.UUID

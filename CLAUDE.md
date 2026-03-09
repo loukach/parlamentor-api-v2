@@ -24,11 +24,18 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 | File | Purpose |
 |------|---------|
 | `api/config.py` | Pydantic Settings, URL normalization |
-| `api/db.py` | Dual async engines + session factories |
-| `api/main.py` | FastAPI app, lifespan, CORS, health endpoint |
+| `api/db.py` | Dual async engines + session factories (Parla pool: `pool_pre_ping`, `pool_recycle=300`) |
+| `api/main.py` | FastAPI app, lifespan, CORS, health endpoint, WS router |
 | `api/models/__init__.py` | 8 SQLAlchemy models (Investigation, Stage, StageOutput, StateSnapshot, GateLog, AgentLog, Message, QueryLog) |
-| `api/routes.py` | REST endpoints (CRUD investigations, stage outputs) |
+| `api/routes.py` | REST endpoints (CRUD investigations, stages, messages, stage outputs) |
 | `api/schemas.py` | Pydantic request/response schemas |
+| `api/orchestrator.py` | State machine, gate logic (approve/revise/reject), snapshots, cost logging |
+| `api/executor.py` | Agent loop (async generator), streaming, tool dispatch, structured extraction |
+| `api/research.py` | Research agent config: system prompt (3 cached blocks), DossierOutput schema, kickoff message |
+| `api/tools.py` | DB search tools (search_initiatives, search_votes, search_deputies, raw_query, request_gate_review) |
+| `api/ws.py` | WebSocket endpoint `/ws/chat/{id}`: message handling, gate decisions, agent orchestration |
+| `api/costs.py` | Anthropic pricing table, cost calculation with cache pricing |
+| `api/tracing.py` | Langfuse TraceContext: span/generation/tool call logging |
 | `scripts/validate_architecture.py` | 5 validation tests (structured output, caching, Langfuse, extraction, tools) |
 | `scripts/seed.py` | Test data seeder |
 
@@ -41,6 +48,7 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 - **Langfuse SDK v3 direct.** `from langfuse import Langfuse`. Use `start_span()` and `start_observation(as_type='generation')`. NOT the OTEL path.
 - **Anthropic structured output.** Use `output_config={"format": {"type": "json_schema", "schema": {...}}}`. Compatible with `thinking`.
 - **Cost calculation.** Backend-computed from token counts (Langfuse has cache token double-counting bug).
+- **Session-per-tool-call.** Each DB tool opens its own Parla session via factory (`async with parla_session_factory() as session`). Prevents SQL errors from poisoning subsequent queries on a shared transaction.
 
 ## Database
 

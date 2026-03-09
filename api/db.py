@@ -14,6 +14,8 @@ app_session_factory = async_sessionmaker(app_engine, expire_on_commit=False)
 parla_engine = create_async_engine(
     settings.parla_db_url,
     pool_size=3,
+    pool_pre_ping=True,
+    pool_recycle=300,
     connect_args={"server_settings": {"default_transaction_read_only": "on"}},
 )
 parla_session_factory = async_sessionmaker(parla_engine, expire_on_commit=False)

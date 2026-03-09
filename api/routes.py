@@ -9,8 +9,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_app_db
-from api.models import Investigation, Stage, StageOutput
-from api.schemas import InvestigationCreate, InvestigationResponse, StageOutputResponse
+from api.models import Investigation, Message, Stage, StageOutput
+from api.schemas import (
+    InvestigationCreate,
+    InvestigationResponse,
+    MessageResponse,
+    StageOutputResponse,
+    StageResponse,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -106,3 +112,37 @@ async def get_stage_output(
         .limit(1)
     )
     return result.scalar()
+
+
+@router.get(
+    "/investigations/{investigation_id}/stages",
+    response_model=list[StageResponse],
+)
+async def list_stages(
+    investigation_id: uuid.UUID, db: AsyncSession = Depends(get_app_db)
+):
+    """Get all stages for an investigation."""
+    result = await db.execute(
+        select(Stage).where(Stage.investigation_id == investigation_id)
+    )
+    stages = result.scalars().all()
+    return sorted(stages, key=lambda s: STAGES.index(s.stage))
+
+
+@router.get(
+    "/investigations/{investigation_id}/messages",
+    response_model=list[MessageResponse],
+)
+async def list_messages(
+    investigation_id: uuid.UUID,
+    limit: int = 200,
+    db: AsyncSession = Depends(get_app_db),
+):
+    """Get messages for an investigation, ordered by creation time."""
+    result = await db.execute(
+        select(Message)
+        .where(Message.investigation_id == investigation_id)
+        .order_by(Message.created_at)
+        .limit(min(limit, 500))
+    )
+    return result.scalars().all()
