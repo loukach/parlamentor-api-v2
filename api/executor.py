@@ -268,9 +268,16 @@ async def run_extraction(
 
     response = await _get_client().messages.create(
         model=model,
-        max_tokens=8192,
+        max_tokens=16384,
         messages=extraction_messages,
         output_config={"format": {"type": "json_schema", "schema": actual_schema}},
+    )
+
+    logger.info(
+        "Extraction response: stop_reason=%s, output_tokens=%s, model=%s",
+        response.stop_reason,
+        response.usage.output_tokens,
+        model,
     )
 
     # Parse the response text as JSON
@@ -278,6 +285,18 @@ async def run_extraction(
     for block in response.content:
         if block.type == "text":
             output_text += block.text
+
+    if response.stop_reason != "end_turn":
+        logger.error(
+            "Extraction truncated (stop_reason=%s, output_tokens=%s, output_chars=%d)",
+            response.stop_reason,
+            response.usage.output_tokens,
+            len(output_text),
+        )
+        raise RuntimeError(
+            f"Extraction output truncated (stop_reason={response.stop_reason}). "
+            f"Output was {len(output_text)} chars / {response.usage.output_tokens} tokens."
+        )
 
     parsed = json.loads(output_text)
 
