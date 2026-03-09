@@ -125,8 +125,8 @@ class TraceContext:
             return
         try:
             if output:
-                self._span.update(output=output[:2000])
-                self._span.update_trace(output=output[:500])
+                self._span.update(output=output[-2000:])
+                self._span.update_trace(output=output[-500:])
             self._span.end()
             if self._langfuse:
                 self._langfuse.flush()
