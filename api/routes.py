@@ -9,11 +9,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db import get_app_db
-from api.models import Investigation, Message, Stage, StageOutput
+from api.models import Investigation, Message, ResearchAssets, Stage, StageOutput
 from api.schemas import (
     InvestigationCreate,
     InvestigationResponse,
     MessageResponse,
+    ResearchAssetsResponse,
     StageOutputResponse,
     StageResponse,
 )
@@ -146,3 +147,20 @@ async def list_messages(
         .limit(min(limit, 500))
     )
     return result.scalars().all()
+
+
+@router.get(
+    "/investigations/{investigation_id}/research-assets",
+    response_model=ResearchAssetsResponse,
+)
+async def get_research_assets(
+    investigation_id: uuid.UUID, db: AsyncSession = Depends(get_app_db)
+):
+    """Get accumulated research assets (initiatives + votes) for an investigation."""
+    result = await db.execute(
+        select(ResearchAssets).where(ResearchAssets.investigation_id == investigation_id)
+    )
+    row = result.scalar()
+    if not row:
+        return ResearchAssetsResponse(initiatives=[], votes=[])
+    return ResearchAssetsResponse(initiatives=row.initiatives or [], votes=row.votes or [])

@@ -125,8 +125,11 @@ class TraceContext:
             return
         try:
             if output:
-                self._span.update(output=output[-2000:])
-                self._span.update_trace(output=output[-500:])
+                # Store full output (Langfuse handles large payloads)
+                self._span.update(output=output)
+                # Trace output: use first 1000 chars as preview
+                preview = output[:1000] + "..." if len(output) > 1000 else output
+                self._span.update_trace(output=preview)
             self._span.end()
             if self._langfuse:
                 self._langfuse.flush()

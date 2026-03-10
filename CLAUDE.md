@@ -26,8 +26,8 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 | `api/config.py` | Pydantic Settings, URL normalization |
 | `api/db.py` | Dual async engines + session factories (Parla pool: `pool_pre_ping`, `pool_recycle=300`) |
 | `api/main.py` | FastAPI app, lifespan, CORS, health endpoint, WS router |
-| `api/models/__init__.py` | 8 SQLAlchemy models (Investigation, Stage, StageOutput, StateSnapshot, GateLog, AgentLog, Message, QueryLog) |
-| `api/routes.py` | REST endpoints (CRUD investigations, stages, messages, stage outputs) |
+| `api/models/__init__.py` | 9 SQLAlchemy models (Investigation, Stage, StageOutput, StateSnapshot, GateLog, AgentLog, Message, QueryLog, ResearchAssets) |
+| `api/routes.py` | REST endpoints (CRUD investigations, stages, messages, stage outputs, research assets) |
 | `api/schemas.py` | Pydantic request/response schemas |
 | `api/orchestrator.py` | State machine, gate logic (approve/revise/reject), snapshots, cost logging |
 | `api/executor.py` | Agent loop (async generator), streaming, tool dispatch, structured extraction |

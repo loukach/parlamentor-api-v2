@@ -5,8 +5,8 @@ Endpoint: GET /ws/chat/{investigation_id}
 Protocol:
   Client -> Server: message, gate_decision, cancel
   Server -> Client: connected, text_delta, thinking, tool_call, tool_result,
-                    usage, stage_output, gate_ready, gate_result, stage_started,
-                    turn_complete, error
+                    usage, stage_output, gate_ready, gate_result,
+                    stage_started, turn_complete, error
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.db import app_session_factory, parla_session_factory
 from api.executor import run_agent, run_extraction
-from api.models import Message
+from api.models import Message, ResearchAssets
 from api.orchestrator import (
     get_state,
     log_api_call,
@@ -34,7 +34,7 @@ from api.research import (
 from api.tools import build_tool_registry
 from api.tracing import TraceContext
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,10 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                 cancel_event.set()
                 if agent_task and not agent_task.done():
                     agent_task.cancel()
+                    try:
+                        await agent_task
+                    except asyncio.CancelledError:
+                        pass
                 await _send(websocket, {"type": "turn_complete"})
                 cancel_event.clear()
 
@@ -333,6 +337,20 @@ async def _run_gate_extraction(
         async with app_session_factory() as app_db:
             await save_output(app_db, investigation_id, stage, parsed_output)
 
+        # Hydrate research assets from curated ini_ids
+        ini_ids = [
+            ini["ini_id"]
+            for ini in parsed_output.get("initiatives", [])
+            if ini.get("ini_id")
+        ]
+        if ini_ids:
+            async with parla_session_factory() as parla_db:
+                initiatives, votes = await _hydrate_assets(parla_db, ini_ids)
+            async with app_session_factory() as app_db:
+                await _upsert_research_assets(
+                    app_db, investigation_id, initiatives, votes
+                )
+
         # Send stage output to client
         await _send(websocket, {
             "type": "stage_output",
@@ -466,6 +484,116 @@ async def _get_latest_feedback(
         )
         gate = result.scalar()
         return gate.feedback if gate else None
+
+
+async def _hydrate_assets(
+    parla_db,
+    ini_ids: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Hydrate full initiative + vote data from Parla DB for curated ini_ids."""
+    if not ini_ids:
+        return [], []
+
+    placeholders = ", ".join(f":id_{i}" for i in range(len(ini_ids)))
+    bind = {f"id_{i}": v for i, v in enumerate(ini_ids)}
+
+    # Fetch initiatives with latest vote
+    ini_sql = f"""
+        SELECT i.id, i.ini_id, i.number, i.title, i.type_description, i.author_name,
+               i.current_status, i.legislature,
+               COALESCE(i.llm_summary, i.summary) AS summary,
+               v.resultado AS vote_result, v.favor, v.contra, v.abstencao, v.vote_date
+        FROM iniciativas i
+        LEFT JOIN LATERAL (
+            SELECT resultado, favor, contra, abstencao, vote_date
+            FROM votes WHERE iniciativa_id = i.id
+            ORDER BY vote_date DESC NULLS LAST LIMIT 1
+        ) v ON true
+        WHERE i.ini_id IN ({placeholders})
+        ORDER BY i.id DESC
+    """
+    result = await parla_db.execute(text(ini_sql), bind)
+    ini_rows = result.mappings().all()
+
+    initiatives = [
+        {
+            "id": r["id"],
+            "ini_id": r["ini_id"],
+            "number": r["number"],
+            "title": r["title"],
+            "type_description": r["type_description"],
+            "party": r["author_name"],
+            "status": r["current_status"],
+            "legislature": r["legislature"],
+            "summary": r["summary"],
+            "vote_result": r["vote_result"],
+            "favor": r["favor"],
+            "contra": r["contra"],
+            "abstencao": r["abstencao"],
+            "vote_date": str(r["vote_date"]) if r["vote_date"] else None,
+        }
+        for r in ini_rows
+    ]
+
+    # Fetch all votes for these initiatives
+    vote_sql = f"""
+        SELECT v.id, v.iniciativa_id, i.ini_id, i.title, i.author_name,
+               v.phase_name, v.vote_date, v.resultado, v.unanime,
+               v.favor, v.contra, v.abstencao, v.detalhe
+        FROM votes v
+        JOIN iniciativas i ON i.id = v.iniciativa_id
+        WHERE i.ini_id IN ({placeholders})
+        ORDER BY v.vote_date DESC NULLS LAST
+    """
+    result = await parla_db.execute(text(vote_sql), bind)
+    vote_rows = result.mappings().all()
+
+    votes = [
+        {
+            "id": r["id"],
+            "initiative_id": r["iniciativa_id"],
+            "ini_id": r["ini_id"],
+            "title": r["title"],
+            "party": r["author_name"],
+            "phase_name": r["phase_name"],
+            "vote_date": str(r["vote_date"]) if r["vote_date"] else None,
+            "resultado": r["resultado"],
+            "unanime": r["unanime"],
+            "favor": r["favor"],
+            "contra": r["contra"],
+            "abstencao": r["abstencao"],
+            "detalhe": r["detalhe"],
+        }
+        for r in vote_rows
+    ]
+
+    logger.info("Hydrated assets: %d initiatives, %d votes", len(initiatives), len(votes))
+    return initiatives, votes
+
+
+async def _upsert_research_assets(
+    db,
+    investigation_id: uuid.UUID,
+    initiatives: list[dict],
+    votes: list[dict],
+) -> None:
+    """Replace research assets for an investigation (full replacement, no merge)."""
+    result = await db.execute(
+        select(ResearchAssets).where(ResearchAssets.investigation_id == investigation_id)
+    )
+    existing = result.scalar()
+
+    if existing:
+        existing.initiatives = initiatives
+        existing.votes = votes
+    else:
+        db.add(ResearchAssets(
+            investigation_id=investigation_id,
+            initiatives=initiatives,
+            votes=votes,
+        ))
+
+    await db.commit()
 
 
 async def _send(websocket: WebSocket, data: dict) -> None:

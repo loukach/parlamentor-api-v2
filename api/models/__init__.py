@@ -167,6 +167,28 @@ class Message(Base):
     )
 
 
+class ResearchAssets(Base):
+    __tablename__ = "research_assets"
+    __table_args__ = (
+        UniqueConstraint("investigation_id", name="uq_research_assets_investigation"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    investigation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("investigations.id", ondelete="CASCADE"), nullable=False
+    )
+    initiatives: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    votes: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class QueryLog(Base):
     __tablename__ = "query_log"
     __table_args__ = (

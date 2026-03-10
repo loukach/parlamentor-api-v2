@@ -55,3 +55,8 @@ class StageOutputResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ResearchAssetsResponse(BaseModel):
+    initiatives: list[dict]
+    votes: list[dict]
