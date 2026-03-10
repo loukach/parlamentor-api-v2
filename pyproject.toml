@@ -16,7 +16,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "anthropic>=0.50.0",
-    "langfuse>=3.0",
+    "langfuse>=3.0,<4.0",
     "python-slugify",
 ]
 
