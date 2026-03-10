@@ -17,7 +17,7 @@ import uuid
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.db import app_session_factory, parla_session_factory
-from api.executor import run_agent, run_extraction
+from api.executor import run_agent
 from api.models import Message, ResearchAssets
 from api.orchestrator import (
     get_state,
@@ -29,7 +29,6 @@ from api.orchestrator import (
 from api.research import (
     DOSSIER_SCHEMA,
     build_research_prompt,
-    get_extraction_prompt,
 )
 from api.tools import build_tool_registry
 from api.tracing import TraceContext
@@ -208,6 +207,8 @@ async def _handle_message(
                     messages=messages,
                     tools=tool_defs,
                     tool_handlers=tool_handlers,
+                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    output_schema=DOSSIER_SCHEMA["schema"],
                     cancel_event=cancel_event,
                 ):
                     event_type = event.get("type")
@@ -264,6 +265,46 @@ async def _handle_message(
                     elif event_type == "error":
                         await _send(websocket, event)
 
+                    elif event_type == "structured_output":
+                        # Agent produced DossierOutput directly (no extraction needed)
+                        parsed_output = event.get("output")
+
+                        # Save output to DB
+                        async with app_session_factory() as app_db2:
+                            await save_output(app_db2, investigation_id, current_stage, parsed_output)
+
+                        # Hydrate research assets from curated ini_ids
+                        ini_ids = [
+                            ini["ini_id"]
+                            for ini in parsed_output.get("initiatives", [])
+                            if ini.get("ini_id")
+                        ]
+                        if ini_ids:
+                            async with parla_session_factory() as parla_db:
+                                initiatives, votes = await _hydrate_assets(parla_db, ini_ids)
+                            async with app_session_factory() as app_db2:
+                                await _upsert_research_assets(
+                                    app_db2, investigation_id, initiatives, votes
+                                )
+
+                        # Send stage output to client
+                        await _send(websocket, {
+                            "type": "stage_output",
+                            "stage": current_stage,
+                            "output": parsed_output,
+                        })
+
+                        # Send gate_ready
+                        summary = parsed_output.get("executive_summary", "")[:200]
+                        await _send(websocket, {
+                            "type": "gate_ready",
+                            "stage": current_stage,
+                            "summary": summary,
+                        })
+
+                        # Store for trace output
+                        trace_output = parsed_output.get("executive_summary", "")
+
                     elif event_type == "agent_done":
                         pass  # Handled below
 
@@ -290,11 +331,8 @@ async def _handle_message(
                         **{k: v for k, v in total_usage.items() if k != "cost_usd"},
                     )
 
-                # If gate review was requested, run extraction
-                if gate_requested:
-                    trace_output = await _run_gate_extraction(
-                        websocket, investigation_id, current_stage, model, messages
-                    ) or ""
+                # Extraction is now handled inline via structured_output event
+                # trace_output is set by the structured_output handler above
 
         else:
             # Placeholder for other stages — just echo back
@@ -312,90 +350,6 @@ async def _handle_message(
         await _send(websocket, {"type": "turn_complete"})
     finally:
         trace.end(output=trace_output or assistant_text)
-
-
-async def _run_gate_extraction(
-    websocket: WebSocket,
-    investigation_id: uuid.UUID,
-    stage: str,
-    model: str,
-    messages: list[dict],
-) -> str | None:
-    """Run structured extraction after request_gate_review and send results.
-
-    Returns the executive_summary for trace output, or None on failure.
-    """
-    try:
-        parsed_output, extraction_usage = await run_extraction(
-            model=model,
-            messages=messages,
-            schema=DOSSIER_SCHEMA,
-            extraction_prompt=get_extraction_prompt(),
-        )
-
-        # Save output to DB
-        async with app_session_factory() as app_db:
-            await save_output(app_db, investigation_id, stage, parsed_output)
-
-        # Hydrate research assets from curated ini_ids
-        ini_ids = [
-            ini["ini_id"]
-            for ini in parsed_output.get("initiatives", [])
-            if ini.get("ini_id")
-        ]
-        if ini_ids:
-            async with parla_session_factory() as parla_db:
-                initiatives, votes = await _hydrate_assets(parla_db, ini_ids)
-            async with app_session_factory() as app_db:
-                await _upsert_research_assets(
-                    app_db, investigation_id, initiatives, votes
-                )
-
-        # Send stage output to client
-        await _send(websocket, {
-            "type": "stage_output",
-            "stage": stage,
-            "output": parsed_output,
-        })
-
-        # Send gate_ready
-        summary = parsed_output.get("executive_summary", "")[:200]
-        await _send(websocket, {
-            "type": "gate_ready",
-            "stage": stage,
-            "summary": summary,
-        })
-
-        # Send extraction usage
-        extraction_cost = extraction_usage.get("cost_usd", 0)
-        if not extraction_cost:
-            from api.costs import calculate_cost
-            extraction_cost = calculate_cost(
-                model,
-                extraction_usage.get("input_tokens", 0),
-                extraction_usage.get("output_tokens", 0),
-                extraction_usage.get("cache_read_tokens", 0),
-                extraction_usage.get("cache_create_tokens", 0),
-            )
-        await _send(websocket, {
-            "type": "usage",
-            "input_tokens": extraction_usage.get("input_tokens", 0),
-            "output_tokens": extraction_usage.get("output_tokens", 0),
-            "cache_read_tokens": extraction_usage.get("cache_read_tokens", 0),
-            "cache_create_tokens": extraction_usage.get("cache_create_tokens", 0),
-            "cost_usd": extraction_cost,
-            "iteration": 0,
-        })
-
-        return parsed_output.get("executive_summary", "")
-
-    except Exception:
-        logger.exception("Extraction failed for %s/%s", investigation_id, stage)
-        await _send(websocket, {
-            "type": "error",
-            "content": "Failed to extract structured dossier. The agent's research is preserved — try again.",
-        })
-        return None
 
 
 async def _handle_gate_decision(

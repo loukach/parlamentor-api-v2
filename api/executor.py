@@ -36,14 +36,19 @@ async def run_agent(
     tools: list[dict],
     tool_handlers: dict[str, callable],
     thinking: dict | None = None,
+    output_schema: dict | None = None,
     cancel_event: asyncio.Event,
 ) -> AsyncGenerator[dict, None]:
     """Run the agent loop, yielding WS message dicts.
 
+    If output_schema is provided, it will be used for structured output
+    after request_gate_review is called.
+
     Yields:
-        text_delta, tool_call, tool_result, thinking, usage, agent_done
+        text_delta, tool_call, tool_result, thinking, usage, agent_done, structured_output
     """
     iteration = 0
+    gate_requested = False
 
     while True:
         if cancel_event.is_set():
@@ -62,6 +67,12 @@ async def run_agent(
         }
         if thinking:
             api_kwargs["thinking"] = thinking
+
+        # If gate was requested, add structured output for final response
+        if gate_requested and output_schema:
+            api_kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": output_schema}
+            }
 
         # Stream the response
         collected_content: list[dict] = []
@@ -186,6 +197,20 @@ async def run_agent(
 
         # Handle stop reason
         if stop_reason == "end_turn":
+            # If gate was requested and we have structured output, parse and yield it
+            if gate_requested and output_schema:
+                output_text = ""
+                for block in assistant_content:
+                    if block["type"] == "text":
+                        output_text += block["text"]
+
+                try:
+                    parsed_output = json.loads(output_text)
+                    yield {"type": "structured_output", "output": parsed_output}
+                except json.JSONDecodeError as e:
+                    logger.error("Failed to parse structured output: %s", e)
+                    yield {"type": "error", "content": f"Failed to parse structured output: {e}"}
+
             yield {"type": "agent_done"}
             return
 
@@ -225,6 +250,10 @@ async def run_agent(
 
                 result_str = json.dumps(result_data, ensure_ascii=False, default=str)
 
+                # Track if gate was requested
+                if tool_name == "request_gate_review":
+                    gate_requested = True
+
                 # Yield tool result
                 yield {
                     "type": "tool_result",
@@ -250,65 +279,6 @@ async def run_agent(
         logger.warning("Unexpected stop_reason: %s", stop_reason)
         yield {"type": "agent_done"}
         return
-
-
-async def run_extraction(
-    model: str,
-    messages: list[dict],
-    schema: dict,
-    extraction_prompt: str,
-) -> tuple[dict, dict]:
-    """Run structured extraction. Returns (parsed_output, usage)."""
-    extraction_messages = messages + [
-        {"role": "user", "content": extraction_prompt}
-    ]
-
-    # If schema has a wrapper (name/strict/schema keys), unwrap to the plain JSON Schema.
-    actual_schema = schema.get("schema", schema) if "schema" in schema else schema
-
-    response = await _get_client().messages.create(
-        model=model,
-        max_tokens=16384,
-        messages=extraction_messages,
-        output_config={"format": {"type": "json_schema", "schema": actual_schema}},
-    )
-
-    logger.info(
-        "Extraction response: stop_reason=%s, output_tokens=%s, model=%s",
-        response.stop_reason,
-        response.usage.output_tokens,
-        model,
-    )
-
-    # Parse the response text as JSON
-    output_text = ""
-    for block in response.content:
-        if block.type == "text":
-            output_text += block.text
-
-    if response.stop_reason != "end_turn":
-        logger.error(
-            "Extraction truncated (stop_reason=%s, output_tokens=%s, output_chars=%d)",
-            response.stop_reason,
-            response.usage.output_tokens,
-            len(output_text),
-        )
-        raise RuntimeError(
-            f"Extraction output truncated (stop_reason={response.stop_reason}). "
-            f"Output was {len(output_text)} chars / {response.usage.output_tokens} tokens."
-        )
-
-    parsed = json.loads(output_text)
-
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-        "cache_read_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
-        "cache_create_tokens": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
-        "model": model,
-    }
-
-    return parsed, usage
 
 
 def _tool_summary(tool_name: str, tool_input: dict) -> str:
