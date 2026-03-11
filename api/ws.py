@@ -16,6 +16,7 @@ import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from api.config import DEFAULT_MODEL
 from api.db import app_session_factory, parla_session_factory
 from api.executor import run_agent
 from api.models import Message, ResearchAssets
@@ -38,9 +39,6 @@ from sqlalchemy import select, text
 logger = logging.getLogger(__name__)
 
 ws_router = APIRouter()
-
-# Default model if client doesn't specify
-DEFAULT_MODEL = "claude-sonnet-4-6"
 
 
 @ws_router.websocket("/ws/chat/{investigation_id}")
@@ -115,7 +113,12 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                     )
                 )
                 try:
-                    await agent_task
+                    await asyncio.wait_for(agent_task, timeout=600)  # 10 min max
+                except asyncio.TimeoutError:
+                    logger.error("Agent task timed out for %s", investigation_id)
+                    cancel_event.set()
+                    await _send(websocket, {"type": "error", "content": "O agente excedeu o tempo limite."})
+                    await _send(websocket, {"type": "turn_complete"})
                 except asyncio.CancelledError:
                     logger.info("Agent task cancelled for %s", investigation_id)
 
@@ -143,7 +146,7 @@ async def _handle_message(
     """Handle a user message: persist, build prompt, run agent, stream results."""
     trace = TraceContext(str(investigation_id), "research", content)
     assistant_text = ""
-    trace_output = ""  # Will hold dossier summary if extraction runs
+    trace_output = ""
 
     try:
         async with app_session_factory() as app_db:
@@ -171,9 +174,6 @@ async def _handle_message(
             # Load conversation history from DB
             messages = await _load_conversation(app_db, investigation_id, current_stage)
 
-            # Check if this is the first message (auto-start)
-            is_kickoff = len(messages) <= 1
-
         # Build prompt and tools based on current stage
         if current_stage == "research":
             # Check for revision feedback
@@ -187,18 +187,15 @@ async def _handle_message(
                     parla_session_factory, app_db, investigation_id, current_stage
                 )
 
-                # If kickoff, use the kickoff message format
-                if is_kickoff and messages:
-                    pass  # User message already in history
-
                 # Run agent
-                gate_requested = False
                 total_usage = {
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "cache_read_tokens": 0,
                     "cache_create_tokens": 0,
                     "cost_usd": 0.0,
+                    "tool_calls_count": 0,
+                    "iteration_count": 0,
                 }
 
                 async for event in run_agent(
@@ -210,6 +207,7 @@ async def _handle_message(
                     thinking={"type": "enabled", "budget_tokens": 10000},
                     output_schema=DOSSIER_SCHEMA["schema"],
                     cancel_event=cancel_event,
+                    trace=trace,
                 ):
                     event_type = event.get("type")
 
@@ -221,6 +219,7 @@ async def _handle_message(
                         await _send(websocket, event)
 
                     elif event_type == "tool_call":
+                        total_usage["tool_calls_count"] += 1
                         await _send(websocket, {
                             "type": "tool_call",
                             "tool": event.get("tool"),
@@ -234,8 +233,6 @@ async def _handle_message(
                             "summary": event.get("summary"),
                             "row_count": event.get("row_count"),
                         })
-                        if event.get("gate_requested"):
-                            gate_requested = True
 
                     elif event_type == "usage":
                         total_usage["input_tokens"] += event.get("input_tokens", 0)
@@ -243,6 +240,7 @@ async def _handle_message(
                         total_usage["cache_read_tokens"] += event.get("cache_read_tokens", 0)
                         total_usage["cache_create_tokens"] += event.get("cache_create_tokens", 0)
                         total_usage["cost_usd"] += event.get("cost_usd", 0.0)
+                        total_usage["iteration_count"] = event.get("iteration", 0)
                         await _send(websocket, {
                             "type": "usage",
                             "input_tokens": total_usage["input_tokens"],
@@ -252,15 +250,6 @@ async def _handle_message(
                             "cost_usd": total_usage["cost_usd"],
                             "iteration": event.get("iteration", 0),
                         })
-
-                        # Log to DB
-                        trace.log_generation(
-                            model=event.get("model", model),
-                            input_messages=messages[-2:],
-                            output=assistant_text[-500:],
-                            usage=event,
-                            iteration=event.get("iteration", 0),
-                        )
 
                     elif event_type == "error":
                         await _send(websocket, event)
@@ -330,9 +319,6 @@ async def _handle_message(
                         model,
                         **{k: v for k, v in total_usage.items() if k != "cost_usd"},
                     )
-
-                # Extraction is now handled inline via structured_output event
-                # trace_output is set by the structured_output handler above
 
         else:
             # Placeholder for other stages — just echo back

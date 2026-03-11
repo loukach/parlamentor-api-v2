@@ -5,7 +5,7 @@ System prompt has 3 blocks:
 - Block 2 (cached): Research phase instructions
 - Block 3 (dynamic): Investigation topic + revision feedback
 
-Blocks 1, 2, and the extraction prompt are fetched from Langfuse (production label)
+Blocks 1 and 2 are fetched from Langfuse (production label)
 with hardcoded fallbacks if Langfuse is unavailable.
 """
 
@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_IDENTITY = "parlamentor-v2-research-identity"
 _PROMPT_INSTRUCTIONS = "parlamentor-v2-research-instructions"
-_PROMPT_EXTRACTION = "parlamentor-v2-research-extraction"
 
 # ---------------------------------------------------------------------------
 # Hardcoded fallbacks (used when Langfuse is unavailable)
@@ -118,7 +117,7 @@ _FALLBACK_INSTRUCTIONS = """\
 ## Research Phase Instructions
 
 You are in the **Research** phase. Your goal is to produce a comprehensive research dossier \
-that will be extracted into a structured format after you signal readiness.
+that you will directly produce as a structured DossierOutput after you signal readiness.
 
 ### Research Methodology
 
@@ -200,10 +199,11 @@ Before calling request_gate_review, verify:
 
 ### Output Expectations
 
-Your research will be extracted into a structured DossierOutput with these fields:
+After calling request_gate_review, the system will require you to produce a structured DossierOutput. \
+You will be constrained to output valid JSON matching the DossierOutput schema with these fields:
 - **executive_summary:** 2-3 paragraphs summarizing the research findings
 - **topic_keywords:** Key search terms used and relevant
-- **initiatives:** List of relevant initiatives with details
+- **initiatives:** List of relevant initiatives with ini_id, title, party, type, status, vote_result, summary, relevance_note
 - **patterns:** Observed voting patterns or legislative trends
 - **voting_summary:** Overview of voting dynamics (if applicable)
 - **data_gaps:** What's missing or needs further investigation
@@ -224,11 +224,6 @@ def _fetch_prompt(name: str) -> str | None:
     except Exception:
         logger.warning("Langfuse prompt '%s' unavailable, using fallback", name)
         return None
-
-
-def get_extraction_prompt() -> str:
-    """Return the extraction prompt, fetching from Langfuse with fallback."""
-    return _fetch_prompt(_PROMPT_EXTRACTION) or _FALLBACK_EXTRACTION
 
 
 async def build_research_prompt(
@@ -275,16 +270,6 @@ async def build_research_prompt(
     blocks.append({"type": "text", "text": "\n\n".join(dynamic_parts)})
 
     return blocks
-
-
-def build_kickoff_message(topic: str) -> str:
-    """Build the initial user message that starts the research."""
-    return (
-        f"Iniciar investigacao sobre: {topic}\n\n"
-        f"Comeca por decompor este tema em sub-questoes pesquisaveis e depois "
-        f"usa as ferramentas de pesquisa sistematicamente. Partilha o teu raciocinio "
-        f"a medida que trabalhas."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -374,13 +359,6 @@ DOSSIER_SCHEMA = {
         "additionalProperties": False,
     },
 }
-
-_FALLBACK_EXTRACTION = (
-    "Based on the research conversation above, extract a structured dossier "
-    "with all findings. Include every relevant initiative found, all observed "
-    "patterns, voting dynamics, data gaps, and recommended next steps. "
-    "Be comprehensive and factual - only include what the data showed."
-)
 
 # Tools available for the research stage
 RESEARCH_TOOLS = [

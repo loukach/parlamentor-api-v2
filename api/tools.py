@@ -188,7 +188,7 @@ TOOL_DEFINITIONS: dict[str, dict] = {
         "description": (
             "Signal that your research is complete and ready for journalist review. "
             "Call this when you have gathered sufficient data and are ready to present findings. "
-            "After calling this tool, a structured dossier will be extracted from your research."
+            "After calling this tool, you will produce a structured DossierOutput with your research."
         ),
         "input_schema": {
             "type": "object",
@@ -546,7 +546,12 @@ async def handle_request_gate_review(
     summary = params.get("summary", "")
     return {
         "status": "gate_review_requested",
-        "message": "Research review has been requested. A structured dossier will now be extracted from your findings. Please wait for the journalist's decision.",
+        "message": (
+            "Research review has been requested. You must now produce your final structured "
+            "research dossier. The system will guide you to output a DossierOutput with: "
+            "executive_summary, topic_keywords, initiatives, patterns, voting_summary, "
+            "data_gaps, and recommended_next_steps."
+        ),
         "summary": summary,
     }
 

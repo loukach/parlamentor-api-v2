@@ -4,16 +4,22 @@ The WebSocket handler iterates and sends each to the client.
 Critical: build assistant message content blocks explicitly - never use model_dump().
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import time
 from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING
 
 import anthropic
 
 from api.config import settings
 from api.costs import calculate_cost
+
+if TYPE_CHECKING:
+    from api.tracing import TraceContext
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +44,14 @@ async def run_agent(
     thinking: dict | None = None,
     output_schema: dict | None = None,
     cancel_event: asyncio.Event,
+    trace: TraceContext | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Run the agent loop, yielding WS message dicts.
 
     If output_schema is provided, it will be used for structured output
     after request_gate_review is called.
+
+    If trace is provided, generations and tool calls are logged to Langfuse.
 
     Yields:
         text_delta, tool_call, tool_result, thinking, usage, agent_done, structured_output
@@ -68,11 +77,13 @@ async def run_agent(
         if thinking:
             api_kwargs["thinking"] = thinking
 
-        # If gate was requested, add structured output for final response
+        # If gate was requested, add structured output and remove tools
+        # so the model can only produce text (the structured JSON)
         if gate_requested and output_schema:
             api_kwargs["output_config"] = {
                 "format": {"type": "json_schema", "schema": output_schema}
             }
+            api_kwargs.pop("tools", None)
 
         # Stream the response
         collected_content: list[dict] = []
@@ -192,6 +203,19 @@ async def run_agent(
             "model": model,
         }
 
+        # Log generation to Langfuse
+        if trace:
+            output_text = "".join(
+                b["text"] for b in assistant_content if b["type"] == "text"
+            )
+            trace.log_generation(
+                model=model,
+                input_messages=messages[-2:],
+                output=output_text,
+                usage={**usage_data, "cost_usd": cost},
+                iteration=iteration,
+            )
+
         # Append assistant message to conversation
         messages.append({"role": "assistant", "content": assistant_content})
 
@@ -240,15 +264,22 @@ async def run_agent(
 
                 handler = tool_handlers.get(tool_name)
                 if handler:
+                    tool_t0 = time.monotonic()
                     try:
                         result_data = await handler(tool_input)
                     except Exception as e:
                         logger.error("Tool %s failed: %s", tool_name, e)
                         result_data = {"error": str(e)}
+                    tool_duration_ms = int((time.monotonic() - tool_t0) * 1000)
                 else:
                     result_data = {"error": f"Unknown tool: {tool_name}"}
+                    tool_duration_ms = 0
 
                 result_str = json.dumps(result_data, ensure_ascii=False, default=str)
+
+                # Log tool call to Langfuse
+                if trace:
+                    trace.log_tool_call(tool_name, tool_input, result_data, tool_duration_ms)
 
                 # Track if gate was requested
                 if tool_name == "request_gate_review":

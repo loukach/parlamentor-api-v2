@@ -70,7 +70,7 @@ class TraceContext:
                 name=f"iteration-{iteration}",
                 model=model,
                 input=input_messages[-3:] if len(input_messages) > 3 else input_messages,
-                output=output[:2000] if output else "",
+                output=output or "",
                 usage_details={
                     "input": usage.get("input_tokens", 0),
                     "output": usage.get("output_tokens", 0),
