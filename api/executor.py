@@ -154,6 +154,7 @@ async def run_agent(
                 assistant_content.append({
                     "type": "thinking",
                     "thinking": block.thinking,
+                    "signature": block.signature,
                 })
             elif block.type == "text":
                 assistant_content.append({

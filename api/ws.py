@@ -48,6 +48,35 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
     # Agent task handle (for cancellation)
     agent_task: asyncio.Task | None = None
     cancel_event = asyncio.Event()
+    timeout_task: asyncio.Task | None = None
+
+    async def _timeout_watchdog(task: asyncio.Task):
+        """Cancel agent task after 10 minutes."""
+        try:
+            await asyncio.sleep(600)
+            if not task.done():
+                logger.error("Agent task timed out for %s", investigation_id)
+                cancel_event.set()
+                await _send(websocket, {"type": "error", "content": "O agente excedeu o tempo limite."})
+                await _send(websocket, {"type": "turn_complete"})
+                task.cancel()
+        except asyncio.CancelledError:
+            pass  # Watchdog cancelled (agent finished or new cancel)
+
+    async def _cancel_agent():
+        """Cancel a running agent task and wait for it to finish."""
+        nonlocal agent_task, timeout_task
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
+            timeout_task = None
+        cancel_event.set()
+        if agent_task and not agent_task.done():
+            agent_task.cancel()
+            try:
+                await agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        agent_task = None
 
     try:
         # Send connected message with current state
@@ -71,26 +100,15 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
             msg_type = msg.get("type", "message")
 
             if msg_type == "cancel":
-                cancel_event.set()
-                if agent_task and not agent_task.done():
-                    agent_task.cancel()
-                    try:
-                        await agent_task
-                    except asyncio.CancelledError:
-                        pass
-                await _send(websocket, {"type": "turn_complete"})
+                was_running = agent_task and not agent_task.done()
+                await _cancel_agent()
+                if was_running:
+                    await _send(websocket, {"type": "turn_complete"})
                 cancel_event.clear()
 
             elif msg_type == "gate_decision":
-                # Cancel any running agent before processing gate
-                if agent_task and not agent_task.done():
-                    cancel_event.set()
-                    agent_task.cancel()
-                    try:
-                        await agent_task
-                    except asyncio.CancelledError:
-                        pass
-                    cancel_event.clear()
+                await _cancel_agent()
+                cancel_event.clear()
                 await _handle_gate_decision(
                     websocket, investigation_id, msg
                 )
@@ -103,28 +121,28 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                 if not content.strip():
                     continue
 
+                # Cancel any running agent before starting new turn
+                if agent_task and not agent_task.done():
+                    await _cancel_agent()
+
                 # Reset cancel event for new turn
                 cancel_event.clear()
 
-                # Run agent in a task so we can cancel it
+                # Run agent as background task (message loop stays free for cancel)
                 agent_task = asyncio.create_task(
                     _handle_message(
                         websocket, investigation_id, content, model, cancel_event
                     )
                 )
-                try:
-                    await asyncio.wait_for(agent_task, timeout=600)  # 10 min max
-                except asyncio.TimeoutError:
-                    logger.error("Agent task timed out for %s", investigation_id)
-                    cancel_event.set()
-                    await _send(websocket, {"type": "error", "content": "O agente excedeu o tempo limite."})
-                    await _send(websocket, {"type": "turn_complete"})
-                except asyncio.CancelledError:
-                    logger.info("Agent task cancelled for %s", investigation_id)
+                timeout_task = asyncio.create_task(
+                    _timeout_watchdog(agent_task)
+                )
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected: %s", investigation_id)
         cancel_event.set()
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
         if agent_task and not agent_task.done():
             agent_task.cancel()
     except Exception:
