@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
+    # Stage-specific model overrides (optional)
+    analysis_model: str = ""  # Defaults to Sonnet 4.6 if not set
+
     # CORS
     cors_origins: str = "http://localhost:5180,https://parlamentor-web.onrender.com"
 

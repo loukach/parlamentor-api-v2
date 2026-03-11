@@ -616,3 +616,30 @@ def build_tool_registry(
     }
 
     return tool_defs, handlers
+
+
+def build_analysis_tool_registry(
+    app_db: AsyncSession,
+    investigation_id: uuid.UUID,
+    stage: str,
+) -> tuple[list[dict], dict[str, callable]]:
+    """Build tool registry for the Analysis stage (only request_gate_review).
+
+    Returns (tool_definitions, tool_handlers) where tool_handlers maps
+    tool name -> async callable(params) -> dict.
+    """
+    tool_defs = [TOOL_DEFINITIONS["request_gate_review"]]
+
+    async def _request_gate_review(params: dict) -> dict:
+        return {
+            "status": "gate_review_requested",
+            "message": (
+                "Analysis review has been requested. You must now produce your final structured "
+                "AnalysisOutput with: executive_summary, findings, and meta notes."
+            ),
+            "summary": params.get("summary", ""),
+        }
+
+    handlers = {"request_gate_review": _request_gate_review}
+
+    return tool_defs, handlers

@@ -135,8 +135,13 @@ async def process_gate(
     stage: str,
     action: str,
     feedback: str | None = None,
+    rationale: dict | None = None,
 ) -> dict:
     """Process gate decision: approve, revise, or reject.
+
+    Args:
+        rationale: Optional metadata dict (e.g., validated_findings, selected_angle_id)
+                   stored as JSON string in GateLog.rationale column.
 
     Returns {"action": str, "next_stage": str | None}.
     """
@@ -150,11 +155,13 @@ async def process_gate(
     await db.flush()
 
     # Log gate decision
+    import json as json_module
     gate_entry = GateLog(
         investigation_id=investigation_id,
         stage=stage,
         action=action,
         feedback=feedback,
+        rationale=json_module.dumps(rationale) if rationale else None,
         snapshot_id=snapshot.id,
     )
     db.add(gate_entry)

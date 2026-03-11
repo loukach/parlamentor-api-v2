@@ -31,7 +31,18 @@ from api.research import (
     DOSSIER_SCHEMA,
     build_research_prompt,
 )
-from api.tools import build_tool_registry
+from api.analysis import (
+    ANALYSIS_SCHEMA,
+    ANALYSIS_MODEL,
+    ANALYSIS_THINKING,
+    build_analysis_prompt,
+)
+from api.editorial import (
+    EDITORIAL_SCHEMA,
+    EDITORIAL_MODEL,
+    build_editorial_prompt,
+)
+from api.tools import build_tool_registry, build_analysis_tool_registry
 from api.tracing import TraceContext
 
 from sqlalchemy import select, text
@@ -109,9 +120,43 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
             elif msg_type == "gate_decision":
                 await _cancel_agent()
                 cancel_event.clear()
-                await _handle_gate_decision(
+                gate_result = await _handle_gate_decision(
                     websocket, investigation_id, msg
                 )
+
+                # Auto-start editorial after analysis approval (cheap Sonnet call)
+                if gate_result and gate_result.get("next_stage") == "editorial":
+                    next_stage = "editorial"
+                    kickoff = "Iniciar fase: editorial"
+
+                    try:
+                        async with app_session_factory() as db:
+                            db.add(Message(
+                                investigation_id=investigation_id,
+                                stage=next_stage,
+                                role="user",
+                                content=kickoff
+                            ))
+                            await db.commit()
+
+                        # Send stage_started
+                        await _send(websocket, {
+                            "type": "stage_started",
+                            "stage": next_stage,
+                        })
+
+                        cancel_event.clear()
+                        agent_task = asyncio.create_task(
+                            _handle_message(websocket, investigation_id, kickoff, DEFAULT_MODEL, cancel_event)
+                        )
+                        timeout_task = asyncio.create_task(_timeout_watchdog(agent_task))
+
+                    except Exception:
+                        logger.exception("Editorial auto-start failed for %s", investigation_id)
+                        await _send(websocket, {
+                            "type": "error",
+                            "content": "A fase editorial falhou. Envie uma mensagem para tentar novamente."
+                        })
 
             else:
                 # Default: treat as user message
@@ -154,6 +199,300 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
             pass
 
 
+async def _stream_agent_events(
+    websocket: WebSocket,
+    agent_generator,
+    gate_requested_at_start: bool = False,
+) -> tuple[dict | None, dict, str]:
+    """Stream agent events to websocket, return (structured_output, total_usage, assistant_text).
+
+    Args:
+        websocket: WebSocket connection
+        agent_generator: AsyncGenerator from run_agent()
+        gate_requested_at_start: True if skill_mode (no tool calls expected)
+
+    Returns:
+        (structured_output_dict, total_usage_dict, assistant_text_str)
+    """
+    gate_requested = gate_requested_at_start
+    assistant_text = ""
+    structured_output = None
+    total_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_create_tokens": 0,
+        "cost_usd": 0.0,
+        "tool_calls_count": 0,
+        "iteration_count": 0,
+    }
+
+    async for event in agent_generator:
+        event_type = event.get("type")
+
+        if event_type == "text_delta":
+            if not gate_requested:
+                # Only stream prose to chat; structured JSON after gate goes to stage_output
+                assistant_text += event.get("content", "")
+                await _send(websocket, event)
+
+        elif event_type == "thinking":
+            await _send(websocket, event)
+
+        elif event_type == "tool_call":
+            total_usage["tool_calls_count"] += 1
+            await _send(websocket, {
+                "type": "tool_call",
+                "tool": event.get("tool"),
+                "summary": event.get("summary"),
+            })
+
+        elif event_type == "tool_result":
+            if event.get("gate_requested"):
+                gate_requested = True
+            await _send(websocket, {
+                "type": "tool_result",
+                "tool": event.get("tool"),
+                "summary": event.get("summary"),
+                "row_count": event.get("row_count"),
+            })
+
+        elif event_type == "usage":
+            total_usage["input_tokens"] += event.get("input_tokens", 0)
+            total_usage["output_tokens"] += event.get("output_tokens", 0)
+            total_usage["cache_read_tokens"] += event.get("cache_read_tokens", 0)
+            total_usage["cache_create_tokens"] += event.get("cache_create_tokens", 0)
+            total_usage["cost_usd"] += event.get("cost_usd", 0.0)
+            total_usage["iteration_count"] = event.get("iteration", 0)
+            await _send(websocket, {
+                "type": "usage",
+                "input_tokens": total_usage["input_tokens"],
+                "output_tokens": total_usage["output_tokens"],
+                "cache_read_tokens": total_usage["cache_read_tokens"],
+                "cache_create_tokens": total_usage["cache_create_tokens"],
+                "cost_usd": total_usage["cost_usd"],
+                "iteration": event.get("iteration", 0),
+            })
+
+        elif event_type == "error":
+            await _send(websocket, event)
+
+        elif event_type == "structured_output":
+            structured_output = event.get("output")
+
+        elif event_type == "agent_done":
+            pass  # Will be handled by caller
+
+    return structured_output, total_usage, assistant_text
+
+
+async def _run_analysis_stage(
+    websocket: WebSocket,
+    investigation_id: uuid.UUID,
+    model: str,
+    cancel_event: asyncio.Event,
+    trace: TraceContext,
+) -> tuple[dict, str]:
+    """Run analysis stage handler. Returns (total_usage, trace_output)."""
+    # Load research output
+    async with app_session_factory() as app_db:
+        state = await get_state(app_db, investigation_id)
+        dossier_output = state["outputs"].get("research", {}).get("output_data", {})
+
+        # Check for revision feedback
+        feedback = await _get_latest_feedback(investigation_id, "analysis")
+
+    # Build prompt
+    system_prompt = await build_analysis_prompt(dossier_output, feedback)
+
+    # Build tools (only request_gate_review)
+    async with app_session_factory() as app_db:
+        tool_defs, tool_handlers = build_analysis_tool_registry(app_db, investigation_id, "analysis")
+
+        # Run agent
+        agent_gen = run_agent(
+            model=ANALYSIS_MODEL,
+            system_prompt=system_prompt,
+            messages=await _load_conversation(app_db, investigation_id, "analysis"),
+            tools=tool_defs,
+            tool_handlers=tool_handlers,
+            thinking=ANALYSIS_THINKING,
+            output_schema=ANALYSIS_SCHEMA["schema"],
+            cancel_event=cancel_event,
+            trace=trace,
+        )
+
+        structured_output, total_usage, assistant_text = await _stream_agent_events(
+            websocket, agent_gen, gate_requested_at_start=False
+        )
+
+        if structured_output:
+            # Save output to DB
+            await save_output(app_db, investigation_id, "analysis", structured_output)
+
+            # Send stage output to client
+            await _send(websocket, {
+                "type": "stage_output",
+                "stage": "analysis",
+                "output": structured_output,
+            })
+
+            # Send gate_ready
+            summary = structured_output.get("executive_summary", "")[:200]
+            await _send(websocket, {
+                "type": "gate_ready",
+                "stage": "analysis",
+                "summary": summary,
+            })
+
+            trace_output = structured_output.get("executive_summary", "")
+        else:
+            trace_output = assistant_text
+
+        # Persist assistant message
+        if assistant_text.strip():
+            async with app_session_factory() as app_db2:
+                assistant_msg = Message(
+                    investigation_id=investigation_id,
+                    stage="analysis",
+                    role="assistant",
+                    content=assistant_text,
+                    metadata_={"model": model, "usage": total_usage},
+                )
+                app_db2.add(assistant_msg)
+                await app_db2.commit()
+
+        # Log API call
+        async with app_session_factory() as app_db2:
+            await log_api_call(
+                app_db2,
+                investigation_id,
+                "analysis",
+                model,
+                **{k: v for k, v in total_usage.items() if k != "cost_usd"},
+            )
+
+    return total_usage, trace_output
+
+
+async def _run_editorial_stage(
+    websocket: WebSocket,
+    investigation_id: uuid.UUID,
+    model: str,
+    cancel_event: asyncio.Event,
+    trace: TraceContext,
+) -> tuple[dict, str]:
+    """Run editorial stage handler (skill mode). Returns (total_usage, trace_output)."""
+    # Load validated findings from analysis gate
+    async with app_session_factory() as app_db:
+        from api.models import GateLog
+        result = await app_db.execute(
+            select(GateLog)
+            .where(
+                GateLog.investigation_id == investigation_id,
+                GateLog.stage == "analysis",
+                GateLog.action == "approve",
+            )
+            .order_by(GateLog.created_at.desc())
+            .limit(1)
+        )
+        gate = result.scalar()
+
+        if not gate or not gate.rationale:
+            await _send(websocket, {
+                "type": "error",
+                "content": "No validated findings from analysis gate. Cannot proceed to editorial."
+            })
+            return {}, ""
+
+        import json as json_module
+        metadata = json_module.loads(gate.rationale)
+        validated_finding_ids = metadata.get("validated_findings", [])
+
+        # Load analysis output and filter findings
+        state = await get_state(app_db, investigation_id)
+        analysis_output = state["outputs"].get("analysis", {}).get("output_data", {})
+        all_findings = analysis_output.get("findings", [])
+        validated_findings = [f for f in all_findings if f.get("id") in validated_finding_ids]
+
+        # Load research summary
+        dossier_output = state["outputs"].get("research", {}).get("output_data", {})
+        dossier_summary = dossier_output.get("executive_summary", "")
+
+        # Check for revision feedback
+        feedback = await _get_latest_feedback(investigation_id, "editorial")
+
+    # Build prompt
+    system_prompt = await build_editorial_prompt(validated_findings, dossier_summary, feedback)
+
+    # Run agent in skill mode (no tools)
+    async with app_session_factory() as app_db:
+        agent_gen = run_agent(
+            model=EDITORIAL_MODEL,
+            system_prompt=system_prompt,
+            messages=await _load_conversation(app_db, investigation_id, "editorial"),
+            tools=[],
+            tool_handlers={},
+            thinking=None,
+            output_schema=EDITORIAL_SCHEMA["schema"],
+            cancel_event=cancel_event,
+            trace=trace,
+            skill_mode=True,
+        )
+
+        structured_output, total_usage, assistant_text = await _stream_agent_events(
+            websocket, agent_gen, gate_requested_at_start=True
+        )
+
+        if structured_output:
+            # Save output to DB
+            await save_output(app_db, investigation_id, "editorial", structured_output)
+
+            # Send stage output to client
+            await _send(websocket, {
+                "type": "stage_output",
+                "stage": "editorial",
+                "output": structured_output,
+            })
+
+            # Send gate_ready
+            recommendation = structured_output.get("recommendation", "")[:200]
+            await _send(websocket, {
+                "type": "gate_ready",
+                "stage": "editorial",
+                "summary": recommendation,
+            })
+
+            trace_output = structured_output.get("recommendation", "")
+        else:
+            trace_output = assistant_text
+
+        # Persist assistant message (editorial typically produces no prose)
+        if assistant_text.strip():
+            async with app_session_factory() as app_db2:
+                assistant_msg = Message(
+                    investigation_id=investigation_id,
+                    stage="editorial",
+                    role="assistant",
+                    content=assistant_text,
+                    metadata_={"model": model, "usage": total_usage},
+                )
+                app_db2.add(assistant_msg)
+                await app_db2.commit()
+
+        # Log API call
+        async with app_session_factory() as app_db2:
+            await log_api_call(
+                app_db2,
+                investigation_id,
+                "editorial",
+                model,
+                **{k: v for k, v in total_usage.items() if k != "cost_usd"},
+            )
+
+    return total_usage, trace_output
+
+
 async def _handle_message(
     websocket: WebSocket,
     investigation_id: uuid.UUID,
@@ -162,7 +501,12 @@ async def _handle_message(
     cancel_event: asyncio.Event,
 ) -> None:
     """Handle a user message: persist, build prompt, run agent, stream results."""
-    trace = TraceContext(str(investigation_id), "research", content)
+    # Get current stage first for TraceContext
+    async with app_session_factory() as app_db_pre:
+        state_pre = await get_state(app_db_pre, investigation_id)
+        current_stage_pre = state_pre["investigation"]["current_stage"]
+
+    trace = TraceContext(str(investigation_id), current_stage_pre, content)
     assistant_text = ""
     trace_output = ""
 
@@ -192,7 +536,7 @@ async def _handle_message(
             # Load conversation history from DB
             messages = await _load_conversation(app_db, investigation_id, current_stage)
 
-        # Build prompt and tools based on current stage
+        # Route to stage handler
         if current_stage == "research":
             # Check for revision feedback
             feedback = await _get_latest_feedback(investigation_id, current_stage)
@@ -206,18 +550,7 @@ async def _handle_message(
                 )
 
                 # Run agent
-                gate_requested = False
-                total_usage = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "cache_create_tokens": 0,
-                    "cost_usd": 0.0,
-                    "tool_calls_count": 0,
-                    "iteration_count": 0,
-                }
-
-                async for event in run_agent(
+                agent_gen = run_agent(
                     model=model,
                     system_prompt=system_prompt,
                     messages=messages,
@@ -227,103 +560,54 @@ async def _handle_message(
                     output_schema=DOSSIER_SCHEMA["schema"],
                     cancel_event=cancel_event,
                     trace=trace,
-                ):
-                    event_type = event.get("type")
+                )
 
-                    if event_type == "text_delta":
-                        if not gate_requested:
-                            # Only stream prose to chat; structured JSON after gate
-                            # goes to stage_output instead
-                            assistant_text += event.get("content", "")
-                            await _send(websocket, event)
+                structured_output, total_usage, assistant_prose = await _stream_agent_events(
+                    websocket, agent_gen, gate_requested_at_start=False
+                )
 
-                    elif event_type == "thinking":
-                        await _send(websocket, event)
+                if structured_output:
+                    # Save output to DB
+                    await save_output(app_db, investigation_id, current_stage, structured_output)
 
-                    elif event_type == "tool_call":
-                        total_usage["tool_calls_count"] += 1
-                        await _send(websocket, {
-                            "type": "tool_call",
-                            "tool": event.get("tool"),
-                            "summary": event.get("summary"),
-                        })
-
-                    elif event_type == "tool_result":
-                        if event.get("gate_requested"):
-                            gate_requested = True
-                        await _send(websocket, {
-                            "type": "tool_result",
-                            "tool": event.get("tool"),
-                            "summary": event.get("summary"),
-                            "row_count": event.get("row_count"),
-                        })
-
-                    elif event_type == "usage":
-                        total_usage["input_tokens"] += event.get("input_tokens", 0)
-                        total_usage["output_tokens"] += event.get("output_tokens", 0)
-                        total_usage["cache_read_tokens"] += event.get("cache_read_tokens", 0)
-                        total_usage["cache_create_tokens"] += event.get("cache_create_tokens", 0)
-                        total_usage["cost_usd"] += event.get("cost_usd", 0.0)
-                        total_usage["iteration_count"] = event.get("iteration", 0)
-                        await _send(websocket, {
-                            "type": "usage",
-                            "input_tokens": total_usage["input_tokens"],
-                            "output_tokens": total_usage["output_tokens"],
-                            "cache_read_tokens": total_usage["cache_read_tokens"],
-                            "cache_create_tokens": total_usage["cache_create_tokens"],
-                            "cost_usd": total_usage["cost_usd"],
-                            "iteration": event.get("iteration", 0),
-                        })
-
-                    elif event_type == "error":
-                        await _send(websocket, event)
-
-                    elif event_type == "structured_output":
-                        # Agent produced DossierOutput directly (no extraction needed)
-                        parsed_output = event.get("output")
-
-                        # Save output to DB
+                    # Hydrate research assets from curated ini_ids
+                    ini_ids = [
+                        ini["ini_id"]
+                        for ini in structured_output.get("initiatives", [])
+                        if ini.get("ini_id")
+                    ]
+                    if ini_ids:
+                        async with parla_session_factory() as parla_db:
+                            initiatives, votes = await _hydrate_assets(parla_db, ini_ids)
                         async with app_session_factory() as app_db2:
-                            await save_output(app_db2, investigation_id, current_stage, parsed_output)
+                            await _upsert_research_assets(
+                                app_db2, investigation_id, initiatives, votes
+                            )
 
-                        # Hydrate research assets from curated ini_ids
-                        ini_ids = [
-                            ini["ini_id"]
-                            for ini in parsed_output.get("initiatives", [])
-                            if ini.get("ini_id")
-                        ]
-                        if ini_ids:
-                            async with parla_session_factory() as parla_db:
-                                initiatives, votes = await _hydrate_assets(parla_db, ini_ids)
-                            async with app_session_factory() as app_db2:
-                                await _upsert_research_assets(
-                                    app_db2, investigation_id, initiatives, votes
-                                )
+                    # Send stage output to client
+                    await _send(websocket, {
+                        "type": "stage_output",
+                        "stage": current_stage,
+                        "output": structured_output,
+                    })
 
-                        # Send stage output to client
-                        await _send(websocket, {
-                            "type": "stage_output",
-                            "stage": current_stage,
-                            "output": parsed_output,
-                        })
+                    # Send gate_ready
+                    summary = structured_output.get("executive_summary", "")[:200]
+                    await _send(websocket, {
+                        "type": "gate_ready",
+                        "stage": current_stage,
+                        "summary": summary,
+                    })
 
-                        # Send gate_ready
-                        summary = parsed_output.get("executive_summary", "")[:200]
-                        await _send(websocket, {
-                            "type": "gate_ready",
-                            "stage": current_stage,
-                            "summary": summary,
-                        })
+                    trace_output = structured_output.get("executive_summary", "")
+                else:
+                    trace_output = assistant_prose
 
-                        # Store for trace output
-                        trace_output = parsed_output.get("executive_summary", "")
-
-                    elif event_type == "agent_done":
-                        pass  # Handled below
+                assistant_text = assistant_prose
 
                 # Persist assistant message
                 if assistant_text.strip():
-                    async with app_session_factory() as app_db:
+                    async with app_session_factory() as app_db2:
                         assistant_msg = Message(
                             investigation_id=investigation_id,
                             stage=current_stage,
@@ -331,25 +615,37 @@ async def _handle_message(
                             content=assistant_text,
                             metadata_={"model": model, "usage": total_usage},
                         )
-                        app_db.add(assistant_msg)
-                        await app_db.commit()
+                        app_db2.add(assistant_msg)
+                        await app_db2.commit()
 
                 # Log API call
-                async with app_session_factory() as app_db:
+                async with app_session_factory() as app_db2:
                     await log_api_call(
-                        app_db,
+                        app_db2,
                         investigation_id,
                         current_stage,
                         model,
                         **{k: v for k, v in total_usage.items() if k != "cost_usd"},
                     )
 
+        elif current_stage == "analysis":
+            total_usage, trace_out = await _run_analysis_stage(
+                websocket, investigation_id, model, cancel_event, trace
+            )
+            trace_output = trace_out
+
+        elif current_stage == "editorial":
+            total_usage, trace_out = await _run_editorial_stage(
+                websocket, investigation_id, model, cancel_event, trace
+            )
+            trace_output = trace_out
+
         else:
-            # Placeholder for other stages — just echo back
+            # Placeholder for other stages
             await _send(websocket, {
                 "type": "text_delta",
                 "content": f"Stage '{current_stage}' agent is not yet implemented. "
-                           f"Only the 'research' stage is available in Phase 1.",
+                           f"Available stages: research, analysis, editorial.",
             })
 
         await _send(websocket, {"type": "turn_complete"})
@@ -366,14 +662,15 @@ async def _handle_gate_decision(
     websocket: WebSocket,
     investigation_id: uuid.UUID,
     msg: dict,
-) -> None:
-    """Process a gate decision from the journalist."""
+) -> dict | None:
+    """Process a gate decision from the journalist. Returns result dict with next_stage."""
     action = msg.get("action", "")
     feedback = msg.get("feedback")
+    metadata = msg.get("metadata")  # Optional metadata (e.g., validated_findings, selected_angle_id)
 
     if action not in ("approve", "revise", "reject"):
         await _send(websocket, {"type": "error", "content": f"Invalid gate action: {action}"})
-        return
+        return None
 
     try:
         async with app_session_factory() as db:
@@ -381,7 +678,7 @@ async def _handle_gate_decision(
             current_stage = state["investigation"]["current_stage"]
 
             result = await process_gate(
-                db, investigation_id, current_stage, action, feedback
+                db, investigation_id, current_stage, action, feedback, rationale=metadata
             )
 
         trace = TraceContext(str(investigation_id), current_stage, f"gate: {action}")
@@ -394,15 +691,19 @@ async def _handle_gate_decision(
             "next_stage": result.get("next_stage"),
         })
 
-        if result.get("next_stage"):
+        # Only send stage_started if NOT auto-starting (auto-start handles this)
+        if result.get("next_stage") and result["next_stage"] != "editorial":
             await _send(websocket, {
                 "type": "stage_started",
                 "stage": result["next_stage"],
             })
 
+        return result
+
     except Exception:
         logger.exception("Gate decision failed for %s", investigation_id)
         await _send(websocket, {"type": "error", "content": "Failed to process gate decision"})
+        return None
 
 
 async def _load_conversation(

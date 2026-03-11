@@ -45,19 +45,29 @@ async def run_agent(
     output_schema: dict | None = None,
     cancel_event: asyncio.Event,
     trace: TraceContext | None = None,
+    skill_mode: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """Run the agent loop, yielding WS message dicts.
 
+    Two modes:
+    1. **Agent mode** (default): Tools available, agent calls request_gate_review to trigger
+       structured extraction, then produces structured output.
+    2. **Skill mode** (skill_mode=True): No tools, structured output produced immediately in
+       a single turn. Used for fast single-call skills like Editorial.
+
     If output_schema is provided, it will be used for structured output
-    after request_gate_review is called.
+    after request_gate_review is called (agent mode) or immediately (skill mode).
 
     If trace is provided, generations and tool calls are logged to Langfuse.
 
     Yields:
         text_delta, tool_call, tool_result, thinking, usage, agent_done, structured_output
     """
+    if skill_mode:
+        assert not tools, "Skill mode cannot have tools"
+
     iteration = 0
-    gate_requested = False
+    gate_requested = skill_mode  # In skill mode, output_config is set from the start
 
     while True:
         if cancel_event.is_set():
@@ -240,6 +250,13 @@ async def run_agent(
             return
 
         if stop_reason == "tool_use":
+            # Defensive: skill_mode should never produce tool calls
+            if skill_mode:
+                logger.warning("Skill mode produced tool_use stop_reason — this should not happen")
+                yield {"type": "error", "content": "Skill produced unexpected tool calls"}
+                yield {"type": "agent_done"}
+                return
+
             # Dispatch all tool calls
             tool_results = []
             tool_call_count = 0
