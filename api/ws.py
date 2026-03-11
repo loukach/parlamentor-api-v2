@@ -206,6 +206,7 @@ async def _handle_message(
                 )
 
                 # Run agent
+                gate_requested = False
                 total_usage = {
                     "input_tokens": 0,
                     "output_tokens": 0,
@@ -230,8 +231,11 @@ async def _handle_message(
                     event_type = event.get("type")
 
                     if event_type == "text_delta":
-                        assistant_text += event.get("content", "")
-                        await _send(websocket, event)
+                        if not gate_requested:
+                            # Only stream prose to chat; structured JSON after gate
+                            # goes to stage_output instead
+                            assistant_text += event.get("content", "")
+                            await _send(websocket, event)
 
                     elif event_type == "thinking":
                         await _send(websocket, event)
@@ -245,6 +249,8 @@ async def _handle_message(
                         })
 
                     elif event_type == "tool_result":
+                        if event.get("gate_requested"):
+                            gate_requested = True
                         await _send(websocket, {
                             "type": "tool_result",
                             "tool": event.get("tool"),
