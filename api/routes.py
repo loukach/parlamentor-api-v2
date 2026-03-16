@@ -21,7 +21,7 @@ from api.schemas import (
 
 router = APIRouter(prefix="/api")
 
-STAGES = ["research", "analysis", "editorial", "visualization", "drafting", "qa"]
+STAGES = ["research", "analysis", "drafting"]
 
 
 @router.post("/investigations", response_model=InvestigationResponse, status_code=201)

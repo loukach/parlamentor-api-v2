@@ -16,10 +16,9 @@ from api.models import (
     Investigation,
     Stage,
     StageOutput,
-    StateSnapshot,
 )
 
-STAGES = ["research", "analysis", "editorial", "visualization", "drafting", "qa"]
+STAGES = ["research", "analysis", "drafting"]
 
 
 async def get_state(db: AsyncSession, investigation_id: uuid.UUID) -> dict:
@@ -98,8 +97,14 @@ async def save_output(
     investigation_id: uuid.UUID,
     stage: str,
     output_data: dict,
+    set_gate_pending: bool = True,
 ) -> StageOutput:
-    """Save stage output, set stage status='gate_pending'."""
+    """Save stage output, optionally set stage status='gate_pending'.
+
+    Args:
+        set_gate_pending: If True (default), sets stage to gate_pending.
+            Set to False for stages with chat-based iteration (e.g. drafting).
+    """
     # Determine version (increment from latest)
     result = await db.execute(
         select(StageOutput.version)
@@ -120,11 +125,12 @@ async def save_output(
     )
     db.add(output)
 
-    await db.execute(
-        update(Stage)
-        .where(Stage.investigation_id == investigation_id, Stage.stage == stage)
-        .values(status="gate_pending")
-    )
+    if set_gate_pending:
+        await db.execute(
+            update(Stage)
+            .where(Stage.investigation_id == investigation_id, Stage.stage == stage)
+            .values(status="gate_pending")
+        )
     await db.commit()
     return output
 
@@ -145,16 +151,7 @@ async def process_gate(
 
     Returns {"action": str, "next_stage": str | None}.
     """
-    # Create state snapshot
-    state = await get_state(db, investigation_id)
-    snapshot = StateSnapshot(
-        investigation_id=investigation_id,
-        snapshot_data=state,
-    )
-    db.add(snapshot)
-    await db.flush()
-
-    # Log gate decision
+    # Log gate decision (no snapshot — table unused)
     import json as json_module
     gate_entry = GateLog(
         investigation_id=investigation_id,
@@ -162,7 +159,6 @@ async def process_gate(
         action=action,
         feedback=feedback,
         rationale=json_module.dumps(rationale) if rationale else None,
-        snapshot_id=snapshot.id,
     )
     db.add(gate_entry)
 

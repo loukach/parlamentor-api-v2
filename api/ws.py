@@ -27,6 +27,7 @@ from api.orchestrator import (
     save_output,
     start_stage,
 )
+from api.prefetch import batch_fetch, expand_keywords
 from api.research import (
     DOSSIER_SCHEMA,
     build_research_prompt,
@@ -37,10 +38,11 @@ from api.analysis import (
     ANALYSIS_THINKING,
     build_analysis_prompt,
 )
-from api.editorial import (
-    EDITORIAL_SCHEMA,
-    EDITORIAL_MODEL,
-    build_editorial_prompt,
+from api.drafting import (
+    DRAFT_SCHEMA,
+    DRAFTING_MODEL,
+    DRAFTING_THINKING,
+    build_drafting_prompt,
 )
 from api.tools import build_tool_registry, build_analysis_tool_registry
 from api.tracing import TraceContext
@@ -124,10 +126,10 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                     websocket, investigation_id, msg
                 )
 
-                # Auto-start editorial after analysis approval (cheap Sonnet call)
-                if gate_result and gate_result.get("next_stage") == "editorial":
-                    next_stage = "editorial"
-                    kickoff = "Iniciar fase: editorial"
+                # Auto-start drafting after analysis approval (angle selected)
+                if gate_result and gate_result.get("next_stage") == "drafting":
+                    next_stage = "drafting"
+                    kickoff = "Iniciar fase: drafting"
 
                     try:
                         async with app_session_factory() as db:
@@ -152,10 +154,10 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                         timeout_task = asyncio.create_task(_timeout_watchdog(agent_task))
 
                     except Exception:
-                        logger.exception("Editorial auto-start failed for %s", investigation_id)
+                        logger.exception("Drafting auto-start failed for %s", investigation_id)
                         await _send(websocket, {
                             "type": "error",
-                            "content": "A fase editorial falhou. Envie uma mensagem para tentar novamente."
+                            "content": "A fase de rascunho falhou. Envie uma mensagem para tentar novamente."
                         })
 
             else:
@@ -375,15 +377,15 @@ async def _run_analysis_stage(
     return total_usage, trace_output
 
 
-async def _run_editorial_stage(
+async def _run_drafting_stage(
     websocket: WebSocket,
     investigation_id: uuid.UUID,
-    model: str,
+    user_feedback: str,
     cancel_event: asyncio.Event,
     trace: TraceContext,
 ) -> tuple[dict, str]:
-    """Run editorial stage handler (skill mode). Returns (total_usage, trace_output)."""
-    # Load validated findings from analysis gate
+    """Run drafting stage handler (skill mode, iterative). Returns (total_usage, trace_output)."""
+    # Load selected angle from analysis gate
     async with app_session_factory() as app_db:
         from api.models import GateLog
         result = await app_db.execute(
@@ -401,40 +403,53 @@ async def _run_editorial_stage(
         if not gate or not gate.rationale:
             await _send(websocket, {
                 "type": "error",
-                "content": "No validated findings from analysis gate. Cannot proceed to editorial."
+                "content": "No angle selected from analysis gate. Cannot proceed to drafting."
             })
             return {}, ""
 
         import json as json_module
         metadata = json_module.loads(gate.rationale)
-        validated_finding_ids = metadata.get("validated_findings", [])
+        selected_angle_id = metadata.get("selected_angle_id")
 
-        # Load analysis output and filter findings
+        # Load analysis output and find selected angle
         state = await get_state(app_db, investigation_id)
         analysis_output = state["outputs"].get("analysis", {}).get("output_data", {})
-        all_findings = analysis_output.get("findings", [])
-        validated_findings = [f for f in all_findings if f.get("id") in validated_finding_ids]
+        all_angles = analysis_output.get("story_angles", [])
+        angle = next((a for a in all_angles if a.get("id") == selected_angle_id), None)
 
-        # Load research summary
+        if not angle:
+            # Fallback: use first angle or journalist's custom angle
+            angle = all_angles[0] if all_angles else {"thesis": user_feedback, "type": "explainer", "outline": [], "key_findings": [], "source_gaps": []}
+
+        # Load research dossier
         dossier_output = state["outputs"].get("research", {}).get("output_data", {})
-        dossier_summary = dossier_output.get("executive_summary", "")
 
-        # Check for revision feedback
-        feedback = await _get_latest_feedback(investigation_id, "editorial")
+        # Load previous draft (if any)
+        latest_draft = state["outputs"].get("drafting", {}).get("output_data")
+
+        # Determine feedback: first run uses kickoff message, revisions use journalist feedback
+        is_first_draft = latest_draft is None
+        feedback = None if is_first_draft else user_feedback
 
     # Build prompt
-    system_prompt = await build_editorial_prompt(validated_findings, dossier_summary, feedback)
+    system_prompt = await build_drafting_prompt(
+        angle=angle,
+        dossier_output=dossier_output,
+        analysis_output=analysis_output,
+        previous_draft=latest_draft,
+        feedback=feedback,
+    )
 
-    # Run agent in skill mode (no tools)
+    # Run Opus in skill mode (no tools, single call)
     async with app_session_factory() as app_db:
         agent_gen = run_agent(
-            model=EDITORIAL_MODEL,
+            model=DRAFTING_MODEL,
             system_prompt=system_prompt,
-            messages=await _load_conversation(app_db, investigation_id, "editorial"),
+            messages=[{"role": "user", "content": "Write the article." if is_first_draft else user_feedback}],
             tools=[],
             tool_handlers={},
-            thinking=None,
-            output_schema=EDITORIAL_SCHEMA["schema"],
+            thinking=DRAFTING_THINKING,
+            output_schema=DRAFT_SCHEMA["schema"],
             cancel_event=cancel_event,
             trace=trace,
             skill_mode=True,
@@ -445,37 +460,31 @@ async def _run_editorial_stage(
         )
 
         if structured_output:
-            # Save output to DB
-            await save_output(app_db, investigation_id, "editorial", structured_output)
+            # Save output WITHOUT gate_pending (chat-based iteration)
+            await save_output(
+                app_db, investigation_id, "drafting", structured_output,
+                set_gate_pending=False,
+            )
 
-            # Send stage output to client
             await _send(websocket, {
                 "type": "stage_output",
-                "stage": "editorial",
+                "stage": "drafting",
                 "output": structured_output,
             })
 
-            # Send gate_ready
-            recommendation = structured_output.get("recommendation", "")[:200]
-            await _send(websocket, {
-                "type": "gate_ready",
-                "stage": "editorial",
-                "summary": recommendation,
-            })
-
-            trace_output = structured_output.get("recommendation", "")
+            trace_output = structured_output.get("title", "")
         else:
             trace_output = assistant_text
 
-        # Persist assistant message (editorial typically produces no prose)
+        # Persist assistant message
         if assistant_text.strip():
             async with app_session_factory() as app_db2:
                 assistant_msg = Message(
                     investigation_id=investigation_id,
-                    stage="editorial",
+                    stage="drafting",
                     role="assistant",
                     content=assistant_text,
-                    metadata_={"model": model, "usage": total_usage},
+                    metadata_={"model": DRAFTING_MODEL, "usage": total_usage},
                 )
                 app_db2.add(assistant_msg)
                 await app_db2.commit()
@@ -485,8 +494,8 @@ async def _run_editorial_stage(
             await log_api_call(
                 app_db2,
                 investigation_id,
-                "editorial",
-                model,
+                "drafting",
+                DRAFTING_MODEL,
                 **{k: v for k, v in total_usage.items() if k != "cost_usd"},
             )
 
@@ -538,18 +547,97 @@ async def _handle_message(
 
         # Route to stage handler
         if current_stage == "research":
-            # Check for revision feedback
+            topic = state["investigation"]["topic"]
             feedback = await _get_latest_feedback(investigation_id, current_stage)
+
+            # Check if we already have research output (revision flow)
+            existing_output = state["outputs"].get("research")
+            is_first_run = existing_output is None
+
+            # Step 1: Pre-fetch data (first run or explicit re-fetch request)
+            prefetch_data = None
+            kw_usage = None
+            if is_first_run:
+                # Expand keywords with Haiku
+                await _send(websocket, {
+                    "type": "tool_call",
+                    "tool": "keyword_expansion",
+                    "summary": f"A expandir palavras-chave: {topic}",
+                })
+                keywords, kw_usage = await expand_keywords(topic)
+                await _send(websocket, {
+                    "type": "tool_result",
+                    "tool": "keyword_expansion",
+                    "summary": f"{len(keywords)} palavras-chave geradas",
+                    "row_count": len(keywords),
+                })
+
+                # Log keyword expansion cost
+                if kw_usage:
+                    await _send(websocket, {
+                        "type": "usage",
+                        "input_tokens": kw_usage["input_tokens"],
+                        "output_tokens": kw_usage["output_tokens"],
+                        "cache_read_tokens": 0,
+                        "cache_create_tokens": 0,
+                        "cost_usd": kw_usage["cost_usd"],
+                        "iteration": 0,
+                    })
+
+                if cancel_event.is_set():
+                    return
+
+                # Batch SQL fetch
+                await _send(websocket, {
+                    "type": "tool_call",
+                    "tool": "batch_fetch",
+                    "summary": "A recolher dados parlamentares",
+                })
+                prefetch_data = await batch_fetch(parla_session_factory, topic, keywords)
+                stats = prefetch_data["stats"]
+                await _send(websocket, {
+                    "type": "tool_result",
+                    "tool": "batch_fetch",
+                    "summary": (
+                        f"{stats['initiative_count']} iniciativas, "
+                        f"{stats['vote_count']} votacoes, "
+                        f"{stats['diploma_count']} diplomas"
+                    ),
+                    "row_count": stats["initiative_count"] + stats["vote_count"] + stats["diploma_count"],
+                })
+
+                if cancel_event.is_set():
+                    return
+
+                # Hydrate research assets for panel display (immediate)
+                ini_ids = [r["ini_id"] for r in prefetch_data["initiatives"] if r.get("ini_id")]
+                if ini_ids:
+                    async with parla_session_factory() as parla_db:
+                        hydrated_inis, hydrated_votes = await _hydrate_assets(parla_db, ini_ids)
+                    async with app_session_factory() as app_db2:
+                        await _upsert_research_assets(
+                            app_db2, investigation_id, hydrated_inis, hydrated_votes
+                        )
+
+            # Step 2: Build prompt with pre-fetched data
             system_prompt = await build_research_prompt(
-                state["investigation"]["topic"], feedback
+                topic, prefetch_data=prefetch_data, feedback=feedback
             )
 
+            # Step 3: Run Sonnet analysis (skill mode — single call)
+            # Keep raw_query + describe_table as escape hatch
             async with app_session_factory() as app_db:
                 tool_defs, tool_handlers = build_tool_registry(
                     parla_session_factory, app_db, investigation_id, current_stage
                 )
 
-                # Run agent
+                # Web search tool (server-side)
+                web_search_tool = {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 3,
+                }
+
                 agent_gen = run_agent(
                     model=model,
                     system_prompt=system_prompt,
@@ -560,38 +648,42 @@ async def _handle_message(
                     output_schema=DOSSIER_SCHEMA["schema"],
                     cancel_event=cancel_event,
                     trace=trace,
+                    server_tools=[web_search_tool],
                 )
 
                 structured_output, total_usage, assistant_prose = await _stream_agent_events(
                     websocket, agent_gen, gate_requested_at_start=False
                 )
 
+                # Add keyword expansion usage to totals
+                if kw_usage:
+                    total_usage["input_tokens"] += kw_usage["input_tokens"]
+                    total_usage["output_tokens"] += kw_usage["output_tokens"]
+                    total_usage["cost_usd"] += kw_usage["cost_usd"]
+
                 if structured_output:
-                    # Save output to DB
                     await save_output(app_db, investigation_id, current_stage, structured_output)
 
-                    # Hydrate research assets from curated ini_ids
-                    ini_ids = [
+                    # Update research assets from curated ini_ids
+                    curated_ini_ids = [
                         ini["ini_id"]
                         for ini in structured_output.get("initiatives", [])
                         if ini.get("ini_id")
                     ]
-                    if ini_ids:
+                    if curated_ini_ids:
                         async with parla_session_factory() as parla_db:
-                            initiatives, votes = await _hydrate_assets(parla_db, ini_ids)
+                            inis, vts = await _hydrate_assets(parla_db, curated_ini_ids)
                         async with app_session_factory() as app_db2:
                             await _upsert_research_assets(
-                                app_db2, investigation_id, initiatives, votes
+                                app_db2, investigation_id, inis, vts
                             )
 
-                    # Send stage output to client
                     await _send(websocket, {
                         "type": "stage_output",
                         "stage": current_stage,
                         "output": structured_output,
                     })
 
-                    # Send gate_ready
                     summary = structured_output.get("executive_summary", "")[:200]
                     await _send(websocket, {
                         "type": "gate_ready",
@@ -605,7 +697,6 @@ async def _handle_message(
 
                 assistant_text = assistant_prose
 
-                # Persist assistant message
                 if assistant_text.strip():
                     async with app_session_factory() as app_db2:
                         assistant_msg = Message(
@@ -618,7 +709,6 @@ async def _handle_message(
                         app_db2.add(assistant_msg)
                         await app_db2.commit()
 
-                # Log API call
                 async with app_session_factory() as app_db2:
                     await log_api_call(
                         app_db2,
@@ -634,18 +724,16 @@ async def _handle_message(
             )
             trace_output = trace_out
 
-        elif current_stage == "editorial":
-            total_usage, trace_out = await _run_editorial_stage(
-                websocket, investigation_id, model, cancel_event, trace
+        elif current_stage == "drafting":
+            total_usage, trace_out = await _run_drafting_stage(
+                websocket, investigation_id, content, cancel_event, trace
             )
             trace_output = trace_out
 
         else:
-            # Placeholder for other stages
             await _send(websocket, {
                 "type": "text_delta",
-                "content": f"Stage '{current_stage}' agent is not yet implemented. "
-                           f"Available stages: research, analysis, editorial.",
+                "content": f"Stage '{current_stage}' is not yet implemented.",
             })
 
         await _send(websocket, {"type": "turn_complete"})
@@ -692,7 +780,7 @@ async def _handle_gate_decision(
         })
 
         # Only send stage_started if NOT auto-starting (auto-start handles this)
-        if result.get("next_stage") and result["next_stage"] != "editorial":
+        if result.get("next_stage") and result["next_stage"] != "drafting":
             await _send(websocket, {
                 "type": "stage_started",
                 "stage": result["next_stage"],

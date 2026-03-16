@@ -1,182 +1,130 @@
-"""Research agent configuration: system prompt, DossierOutput schema, tool list.
+"""Research stage configuration: analyst prompt, DossierOutput schema.
 
-System prompt has 3 blocks:
-- Block 1 (cached): Identity + data rules + parliamentary knowledge + tool rules
-- Block 2 (cached): Research phase instructions
-- Block 3 (dynamic): Investigation topic + revision feedback
+The research stage now works as a skill-mode analyst:
+1. System pre-fetches data (initiatives, votes, diplomas, media) via prefetch.py
+2. Data is shown to journalist in panel immediately
+3. Sonnet analyzes pre-fetched data in a single skill-mode call
+4. Produces DossierOutput (summary, patterns, gaps, curated references)
 
-Blocks 1 and 2 are fetched from Langfuse (production label)
-with hardcoded fallbacks if Langfuse is unavailable.
+Escape hatch: raw_query tool available for ~1 in 5 investigations.
 """
 
+import json
 import logging
 
 from api.prompts import fetch_prompt, get_identity
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Langfuse prompt names
-# ---------------------------------------------------------------------------
-
 _PROMPT_INSTRUCTIONS = "parlamentor-v2-research-instructions"
 
-# ---------------------------------------------------------------------------
-# Hardcoded fallbacks (used when Langfuse is unavailable)
-# ---------------------------------------------------------------------------
-
-# Block 1: Identity is now shared via api.prompts.get_identity()
-# Additional research-specific tool rules appended to identity block.
-_TOOL_RULES = """
-
-## Tool Usage Rules
-
-1. **Start broad, then narrow.** Begin with keyword searches to understand the landscape, then drill \
-down into specific initiatives, votes, or deputies.
-2. **Use typed tools first.** Prefer `search_initiatives`, `search_votes`, `search_deputies` over \
-`raw_query`. Use `raw_query` only when the typed tools cannot answer your question.
-3. **Cross-reference.** When you find interesting initiatives, look up their votes. When you find \
-surprising votes, look up the initiative details.
-4. **Be systematic.** Search from multiple angles: by keyword, by party, by type of initiative. \
-Don't rely on a single search.
-5. **Respect limits.** Default results are capped at 30. If you need more, increase the limit \
-parameter (max 100). If you suspect there are more results, refine your search or note the gap.
-6. **Log your reasoning.** Think through what you're looking for before each tool call. This helps \
-the journalist understand your research methodology.
-7. **When done, call request_gate_review.** Once you have sufficient evidence to produce a comprehensive \
-dossier, call this tool. Don't wait for perfection - the journalist can always request revisions.
-8. **Always call describe_table before raw_query on an unfamiliar table.** This returns the exact \
-column names and types. Never guess column names — wrong names abort the query. Call describe_table \
-once per table you haven't described yet in this session, then use the returned columns in your SQL."""
-
-# Block 2: Research phase specific instructions
-# Must be >= 1024 tokens for caching. Marked with cache_control.
+# Fallback instructions for analyst mode (>= 1024 tokens for caching)
 _FALLBACK_INSTRUCTIONS = """\
 ## Research Phase Instructions
 
-You are in the **Research** phase. Your goal is to produce a comprehensive research dossier \
-that you will directly produce as a structured DossierOutput after you signal readiness.
+You are in the **Research** phase. The system has already pre-fetched parliamentary data \
+for this investigation topic. Your job is to **analyze the pre-fetched data** and produce \
+a structured research dossier.
 
-### Research Methodology
+### What You Have
 
-Follow this systematic approach:
+The system queried the parliamentary database and found:
+- **Initiatives**: Bills, proposals, petitions matching the topic keywords
+- **Votes**: Voting records for those initiatives
+- **Diplomas**: Published legislation resulting from matched initiatives
+- **Media signals**: Recent headlines from Portuguese media (if available)
 
-1. **Topic Decomposition:** Break the investigation topic into searchable sub-questions. \
-For example, "Que solucoes propoe cada partido para a crise habitacional?" becomes:
-   - What housing-related initiatives exist in the current legislature?
-   - Which parties proposed them?
-   - What types of initiatives (binding laws vs non-binding resolutions)?
-   - How did the votes go? Are there cross-party alignments or surprising splits?
-   - What's the current status of key initiatives?
+This data is provided in the dynamic context below. Not all of it will be relevant — \
+your job is to select and analyze only what pertains to the investigation topic.
 
-2. **Data Collection:** Use your tools to systematically gather data for each sub-question. \
-Plan your searches to cover different angles:
-   - Keyword searches (try multiple Portuguese terms and synonyms)
-   - Party-specific searches (compare what each party proposed)
-   - Vote pattern analysis (look for unusual coalitions or splits)
-   - Status tracking (what passed, what's stuck in committee, what was rejected)
+### Your Task
 
-3. **Pattern Recognition:** As you collect data, look for patterns:
-   - Parties that consistently vote together or against each other on this topic
-   - Initiatives that stalled in committee without a vote
+Analyze the pre-fetched data and produce a DossierOutput containing:
+1. **Executive summary**: 2-3 paragraphs on the key findings
+2. **Topic keywords**: Relevant search terms (the system already expanded these, but refine if needed)
+3. **Initiatives**: Select the most relevant ones, add a relevance_note for each
+4. **Patterns**: Identify voting patterns, party alignments, legislative trends
+5. **Voting summary**: Overview of voting dynamics (if applicable)
+6. **Diplomas**: Relevant published legislation with context
+7. **Media signals**: Recent media coverage providing context
+8. **Data gaps**: What's missing that a journalist should investigate
+9. **Recommended next steps**: Suggestions for deepening the investigation
+
+### Analysis Methodology
+
+1. **Filter for relevance**: Not all pre-fetched data is relevant. Focus on items directly \
+related to the investigation topic. Discard noise.
+
+2. **Cross-reference**: Link initiatives to their votes and diplomas. Which proposals became law? \
+Which were rejected? Which are stuck in committee?
+
+3. **Identify patterns**: Look for:
+   - Parties that consistently vote together or against each other
+   - Initiatives that stalled without a vote
    - Differences between binding legislation and non-binding resolutions
-   - Timeline patterns (bursts of activity around media events or elections)
    - Government vs opposition dynamics
 
-4. **Gap Identification:** Note what data is missing or incomplete:
-   - Topics where no initiatives exist (absence of legislative action)
-   - Votes without clear records
-   - Initiatives where the agent couldn't find detailed information
-   - Areas that might need human research (interviews, external sources)
+4. **Assess completeness**: Is the pre-fetched data sufficient? If you identify critical gaps, \
+note them. The journalist can ask for more data via chat, and you have a raw_query escape hatch \
+for specific SQL queries if truly needed.
 
-5. **Synthesis:** Before calling request_gate_review, mentally organize your findings:
-   - What's the main story?
-   - What are the 3-5 most significant findings?
-   - What voting patterns emerged?
-   - What are the clear next steps for deeper investigation?
+5. **Be honest about limitations**: If the data doesn't support a conclusion, say so.
 
 ### Communication Style
 
-While researching:
-- **Think out loud.** Share your reasoning with the journalist as you work. \
-Explain why you're making each search and what you expect to find.
-- **Be honest about uncertainty.** If data is ambiguous or incomplete, say so.
-- **Use Portuguese parliamentary terms** when discussing specific concepts, but explain \
-them if they might be unfamiliar.
-- **Summarize after each tool call.** Briefly note what you found and how it relates to \
-the investigation topic.
-- **Build a narrative.** Connect your findings into a coherent story arc that the journalist \
-can follow.
+- **Be direct**: No hedging or filler
+- **Use Portuguese parliamentary terms** when discussing specific concepts
+- **Be specific**: Reference initiatives by ini_id, parties by name
+- **Think critically**: Don't just restate the data — analyze what it means
 
-### Handling Revisions
+### Handling User Messages
 
-If the journalist sends you back for revision (with feedback):
-- Read the feedback carefully.
-- Address each point specifically.
-- Don't repeat research you've already done unless the feedback asks for it.
-- Focus on the gaps or angles the journalist identified.
-- Call request_gate_review again when you've addressed the feedback.
+The journalist may ask for more data or adjustments:
+- If they ask to check a specific party or topic, use the raw_query tool
+- If they provide additional context, incorporate it into your analysis
+- After addressing their request, update your DossierOutput
 
-### Handling User Messages During Research
+### Using raw_query (Escape Hatch)
 
-The journalist may send messages while you're working:
-- Respond to questions about your methodology or findings.
-- Adjust your research direction if asked.
-- Note any additional context or leads the journalist provides.
-- Continue your systematic research after addressing the message.
+You have access to a `raw_query` tool for direct SQL queries against the parliamentary database. \
+Use it ONLY when the pre-fetched data clearly lacks a critical dimension. Most investigations \
+should not need it. Always call `describe_table` first to check column names.
 
 ### Quality Checklist
 
-Before calling request_gate_review, verify:
-- [ ] You've searched with multiple relevant keywords
-- [ ] You've checked initiatives from the major parties (PS, PSD/AD, CH, IL, BE, PCP, L)
-- [ ] You've examined voting records for key initiatives
+Before producing your output, verify:
+- [ ] You've filtered pre-fetched data for relevance
 - [ ] You've identified at least one notable pattern or finding
+- [ ] You've cross-referenced initiatives with votes and diplomas
 - [ ] You've noted data gaps honestly
-- [ ] You've provided enough raw data for the journalist to evaluate
-
-### Output Expectations
-
-After calling request_gate_review, the system will require you to produce a structured DossierOutput. \
-You will be constrained to output valid JSON matching the DossierOutput schema with these fields:
-- **executive_summary:** 2-3 paragraphs summarizing the research findings
-- **topic_keywords:** Key search terms used and relevant
-- **initiatives:** List of relevant initiatives with ini_id, title, party, type, status, vote_result, summary, relevance_note
-- **patterns:** Observed voting patterns or legislative trends
-- **voting_summary:** Overview of voting dynamics (if applicable)
-- **data_gaps:** What's missing or needs further investigation
-- **recommended_next_steps:** Suggestions for the Analysis phase
-
-Ensure your research is thorough enough to populate all these fields meaningfully.\
+- [ ] Relevance notes explain why each initiative matters
+- [ ] Executive summary captures the key insights\
 """
 
 
 async def build_research_prompt(
     topic: str,
+    prefetch_data: dict | None = None,
     feedback: str | None = None,
 ) -> list[dict]:
-    """Build the system prompt content blocks for the Research agent.
+    """Build the system prompt content blocks for the Research analyst.
+
+    Args:
+        topic: Investigation topic
+        prefetch_data: Pre-fetched data dict (initiatives, votes, diplomas)
+        feedback: Revision feedback from journalist
 
     Returns list of content blocks with cache_control markers.
-    Block 1 + Block 2 are cached (>= 1024 tokens each).
-    Block 3 is dynamic (topic + feedback).
-
-    Prompt text is fetched from Langfuse (production label) with
-    hardcoded fallbacks if Langfuse is unavailable.
     """
-    # Block 1: Shared identity + research tool rules
-    identity = get_identity() + _TOOL_RULES
-    # Block 2: Research-specific instructions
+    identity = get_identity()
     instructions = fetch_prompt(_PROMPT_INSTRUCTIONS) or _FALLBACK_INSTRUCTIONS
 
     blocks = [
-        # Block 1: Identity + rules (cached)
         {
             "type": "text",
             "text": identity,
             "cache_control": {"type": "ephemeral"},
         },
-        # Block 2: Research instructions (cached)
         {
             "type": "text",
             "text": instructions,
@@ -184,8 +132,28 @@ async def build_research_prompt(
         },
     ]
 
-    # Block 3: Dynamic context (not cached)
+    # Block 3: Dynamic context (topic + pre-fetched data + feedback)
     dynamic_parts = [f"## Current Investigation\n\nTopic: {topic}"]
+
+    if prefetch_data:
+        stats = prefetch_data.get("stats", {})
+        dynamic_parts.append(
+            f"\n\n## Pre-Fetched Data\n\n"
+            f"The system found {stats.get('initiative_count', 0)} initiatives, "
+            f"{stats.get('vote_count', 0)} votes, and "
+            f"{stats.get('diploma_count', 0)} diplomas.\n\n"
+            f"### Initiatives\n```json\n"
+            f"{json.dumps(prefetch_data.get('initiatives', []), indent=2, ensure_ascii=False)}\n```\n\n"
+            f"### Votes\n```json\n"
+            f"{json.dumps(prefetch_data.get('votes', []), indent=2, ensure_ascii=False)}\n```\n\n"
+            f"### Diplomas\n```json\n"
+            f"{json.dumps(prefetch_data.get('diplomas', []), indent=2, ensure_ascii=False)}\n```"
+        )
+        if prefetch_data.get("media_signals"):
+            dynamic_parts.append(
+                f"\n\n### Media Signals\n```json\n"
+                f"{json.dumps(prefetch_data['media_signals'], indent=2, ensure_ascii=False)}\n```"
+            )
 
     if feedback:
         dynamic_parts.append(
@@ -238,7 +206,7 @@ DOSSIER_SCHEMA = {
                     ],
                     "additionalProperties": False,
                 },
-                "description": "Relevant initiatives found during research.",
+                "description": "Relevant initiatives curated from pre-fetched data.",
             },
             "patterns": {
                 "type": "array",
@@ -268,6 +236,46 @@ DOSSIER_SCHEMA = {
                 "additionalProperties": False,
                 "description": "Overview of voting dynamics, or null if not applicable.",
             },
+            "diplomas": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "diploma_id": {"type": ["integer", "null"]},
+                        "tipo": {"type": "string"},
+                        "numero": {"type": ["string", "null"]},
+                        "titulo": {"type": ["string", "null"]},
+                        "pub_date": {"type": ["string", "null"]},
+                        "related_initiatives": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "relevance_note": {"type": "string"},
+                    },
+                    "required": [
+                        "diploma_id", "tipo", "numero", "titulo",
+                        "pub_date", "related_initiatives", "relevance_note",
+                    ],
+                    "additionalProperties": False,
+                },
+                "description": "Relevant diplomas (published legislation).",
+            },
+            "media_signals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "headline": {"type": "string"},
+                        "source": {"type": "string"},
+                        "url": {"type": "string"},
+                        "date": {"type": ["string", "null"]},
+                        "relevance_note": {"type": "string"},
+                    },
+                    "required": ["headline", "source", "url", "date", "relevance_note"],
+                    "additionalProperties": False,
+                },
+                "description": "Media headlines providing context.",
+            },
             "data_gaps": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -281,18 +289,9 @@ DOSSIER_SCHEMA = {
         },
         "required": [
             "executive_summary", "topic_keywords", "initiatives", "patterns",
-            "voting_summary", "data_gaps", "recommended_next_steps",
+            "voting_summary", "diplomas", "media_signals",
+            "data_gaps", "recommended_next_steps",
         ],
         "additionalProperties": False,
     },
 }
-
-# Tools available for the research stage
-RESEARCH_TOOLS = [
-    "search_initiatives",
-    "search_votes",
-    "search_deputies",
-    "describe_table",
-    "raw_query",
-    "request_gate_review",
-]

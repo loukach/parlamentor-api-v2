@@ -24,6 +24,7 @@ MAX_LIMIT = 100
 PARLA_TABLES = frozenset({
     "iniciativas", "iniciativa_events", "votes", "deputados",
     "intervencoes", "speech_transcripts", "iniciativa_autores", "iniciativa_comissao",
+    "diplomas", "diploma_iniciativas",
 })
 
 
@@ -144,7 +145,8 @@ TOOL_DEFINITIONS: dict[str, dict] = {
             "Get the column names and types for a parliamentary database table. "
             "Call this BEFORE writing raw_query SQL to avoid column-name errors. "
             "Available tables: iniciativas, iniciativa_events, votes, deputados, "
-            "intervencoes, speech_transcripts, iniciativa_autores, iniciativa_comissao."
+            "intervencoes, speech_transcripts, iniciativa_autores, iniciativa_comissao, "
+            "diplomas, diploma_iniciativas."
         ),
         "input_schema": {
             "type": "object",

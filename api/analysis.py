@@ -1,7 +1,8 @@
-"""Analysis agent configuration: system prompt, AnalysisOutput schema, model routing.
+"""Analysis stage configuration: system prompt, AnalysisOutput schema, model routing.
 
 Analysis stage follows Research. The agent receives the DossierOutput from research
-and produces structured AnalysisOutput with findings, executive summary, and meta notes.
+and produces AnalysisOutput with findings, story angles, and a recommendation.
+Merges previous Analysis + Editorial into a single skill-mode call.
 """
 
 import json
@@ -19,57 +20,68 @@ _FALLBACK_INSTRUCTIONS = """\
 ## Analysis Phase Instructions
 
 You are in the **Analysis** phase. Your goal is to analyze the research dossier produced in the \
-previous stage and identify newsworthy findings.
+previous stage, identify newsworthy findings, and propose story angles.
 
 ### Your Task
 
 You have been given a DossierOutput containing:
 - Executive summary of research findings
-- List of relevant legislative initiatives
+- List of relevant legislative initiatives (with relevance notes)
 - Observed voting patterns
 - Voting summary (alignments and splits)
+- Diplomas (published legislation)
+- Media signals (recent headlines)
 - Data gaps
 - Recommended next steps
 
-Your job is to **analyze this data** and produce structured findings. Each finding should be:
+Your job is to:
+1. **Analyze this data** and produce structured findings
+2. **Propose 2-3 story angles** based on those findings
+
+### Part 1: Findings
+
+Each finding should be:
 - **Newsworthy**: Does it reveal something surprising, significant, or contradictory?
 - **Evidence-based**: Grounded in the dossier data, not speculation
 - **Clear**: The headline and description should be understandable to a non-expert
 
-### Finding Types
-
+**Finding Types:**
 - **pattern**: Recurring behavior across multiple initiatives or votes
 - **contradiction**: Party rhetoric vs voting behavior, or internal party splits
 - **trend**: Change over time (requires historical comparison)
 - **anomaly**: Unexpected outcome or surprising vote alignment
 - **connection**: Link between different initiatives, parties, or events
 
-### Newsworthiness Assessment
-
-For each finding, rate its newsworthiness:
+**Newsworthiness Assessment:**
 - **high**: Front-page material, major contradiction or pattern
 - **medium**: Noteworthy but not shocking, good for feature stories
 - **low**: Minor detail, useful context but not headline-worthy
 
-### Evidence and Counter-Evidence
+**Evidence and Counter-Evidence:**
+- **evidence**: List specific initiatives, votes, or data points
+- **counter_evidence**: Note any data that contradicts or weakens this finding
 
-- **evidence**: List specific initiatives, votes, or data points from the dossier that support this finding
-- **counter_evidence**: Note any data that contradicts or weakens this finding (if any)
+### Part 2: Story Angles
 
-### Executive Summary
+Propose 2-3 distinct editorial angles — different ways to tell this story. Each angle should:
+- **Have a clear thesis**: What's the main argument or narrative arc?
+- **Outline the structure**: How would the story be organized?
+- **Identify source gaps**: What additional interviews or research would strengthen this angle?
 
-Write a 1-paragraph overview (3-5 sentences) summarizing the most significant findings. \
-This will help the journalist quickly understand the analysis results.
+**Angle Types:**
+- **accountability**: Holding specific actors accountable for contradictions or failures
+- **systemic**: Examining systemic patterns or structural issues
+- **comparative**: Comparing different parties, legislatures, or time periods
+- **human_impact**: Focusing on how legislative action/inaction affects people
+- **explainer**: Deep-dive explainer on a complex topic revealed by the data
 
-### Meta Notes
+### Recommendation
 
-In the `meta` section:
-- **dossier_coverage**: Comment on the quality and completeness of the research dossier
-- **confidence_notes**: Note any caveats, data quality issues, or areas where additional research would strengthen findings
+Recommend **one angle** and explain why. Consider newsworthiness, feasibility, and impact.
 
 ### Communication Style
 
-- **Be direct**: No hedging language ("it seems that", "perhaps", "it might be")
+- **Be direct**: No hedging language
 - **Be specific**: Reference exact initiatives by ini_id, parties by name
 - **Be honest**: If evidence is thin or ambiguous, say so explicitly
 - **Think critically**: Don't just restate patterns from the dossier — analyze what they mean
@@ -88,18 +100,10 @@ Before calling request_gate_review, verify:
 - [ ] At least 3 findings identified
 - [ ] Each finding has clear evidence from the dossier
 - [ ] Newsworthiness ratings are justified
-- [ ] Executive summary captures the key insights
-- [ ] Counter-evidence noted where relevant
-- [ ] No speculation beyond what the data shows
-
-### Output Expectations
-
-After calling request_gate_review, you will produce a structured AnalysisOutput with:
-- **executive_summary**: 1 paragraph overview of findings
-- **findings**: List of structured findings (headline, description, evidence, type, newsworthiness)
-- **meta**: Dossier coverage notes and confidence assessment
-
-Ensure your analysis is thorough enough to populate all these fields meaningfully.\
+- [ ] 2-3 story angles proposed
+- [ ] Each angle has a clear thesis and structure
+- [ ] One angle recommended with justification
+- [ ] Executive summary captures the key insights\
 """
 
 ANALYSIS_MODEL = settings.analysis_model or "claude-sonnet-4-6"
@@ -113,25 +117,16 @@ async def build_analysis_prompt(
     """Build the system prompt content blocks for the Analysis agent.
 
     Returns list of content blocks with cache_control markers.
-    Block 1 + Block 2 are cached (>= 1024 tokens each).
-    Block 3 is dynamic (dossier + feedback).
-
-    Prompt text is fetched from Langfuse (production label) with
-    hardcoded fallbacks if Langfuse is unavailable.
     """
-    # Block 1: Shared identity
     identity = get_identity()
-    # Block 2: Analysis-specific instructions
     instructions = fetch_prompt(_PROMPT_INSTRUCTIONS) or _FALLBACK_INSTRUCTIONS
 
     blocks = [
-        # Block 1: Identity (cached)
         {
             "type": "text",
             "text": identity,
             "cache_control": {"type": "ephemeral"},
         },
-        # Block 2: Analysis instructions (cached)
         {
             "type": "text",
             "text": instructions,
@@ -159,7 +154,7 @@ async def build_analysis_prompt(
 
 
 # ---------------------------------------------------------------------------
-# AnalysisOutput JSON Schema (for structured extraction)
+# AnalysisOutput JSON Schema — merged findings + story angles
 # ---------------------------------------------------------------------------
 
 ANALYSIS_SCHEMA = {
@@ -197,12 +192,12 @@ ANALYSIS_SCHEMA = {
                         "evidence": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "List of specific evidence from the dossier (initiative IDs, vote records, patterns).",
+                            "description": "Specific evidence from the dossier.",
                         },
                         "counter_evidence": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "List of data that contradicts or weakens this finding (if any).",
+                            "description": "Data that contradicts or weakens this finding.",
                         },
                         "newsworthiness": {
                             "type": "string",
@@ -222,24 +217,51 @@ ANALYSIS_SCHEMA = {
                 },
                 "description": "List of analysis findings.",
             },
-            "meta": {
-                "type": "object",
-                "properties": {
-                    "dossier_coverage": {
-                        "type": "string",
-                        "description": "Assessment of the research dossier quality and completeness.",
+            "story_angles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Unique identifier (UUID format) for this angle.",
+                        },
+                        "thesis": {
+                            "type": "string",
+                            "description": "1 sentence thesis statement.",
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["accountability", "systemic", "comparative", "human_impact", "explainer"],
+                            "description": "Type of editorial angle.",
+                        },
+                        "outline": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Story structure outline (section headings/descriptions).",
+                        },
+                        "key_findings": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Finding IDs central to this angle.",
+                        },
+                        "source_gaps": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Additional sources or research needed.",
+                        },
                     },
-                    "confidence_notes": {
-                        "type": "string",
-                        "description": "Caveats, data quality issues, or areas needing additional research.",
-                    },
+                    "required": ["id", "thesis", "type", "outline", "key_findings", "source_gaps"],
+                    "additionalProperties": False,
                 },
-                "required": ["dossier_coverage", "confidence_notes"],
-                "additionalProperties": False,
-                "description": "Meta notes about the analysis.",
+                "description": "Proposed story angles.",
+            },
+            "recommendation": {
+                "type": "string",
+                "description": "Which angle to pursue and why (2-3 sentences).",
             },
         },
-        "required": ["executive_summary", "findings", "meta"],
+        "required": ["executive_summary", "findings", "story_angles", "recommendation"],
         "additionalProperties": False,
     },
 }

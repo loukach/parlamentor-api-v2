@@ -46,6 +46,7 @@ async def run_agent(
     cancel_event: asyncio.Event,
     trace: TraceContext | None = None,
     skill_mode: bool = False,
+    server_tools: list[dict] | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Run the agent loop, yielding WS message dicts.
 
@@ -77,12 +78,16 @@ async def run_agent(
         t0 = time.monotonic()
 
         # Build API call kwargs
+        all_tools = list(tools)
+        if server_tools:
+            all_tools.extend(server_tools)
+
         api_kwargs: dict = {
             "model": model,
             "max_tokens": 16384,
             "system": system_prompt,
             "messages": messages,
-            "tools": tools,
+            "tools": all_tools,
         }
         if thinking:
             api_kwargs["thinking"] = thinking
@@ -115,6 +120,13 @@ async def run_agent(
                         elif block.type == "tool_use":
                             collected_content.append({
                                 "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": {},
+                            })
+                        elif block.type == "server_tool_use":
+                            collected_content.append({
+                                "type": "server_tool_use",
                                 "id": block.id,
                                 "name": block.name,
                                 "input": {},
@@ -177,6 +189,28 @@ async def run_agent(
                     "id": block.id,
                     "name": block.name,
                     "input": block.input,
+                })
+            elif block.type == "server_tool_use":
+                assistant_content.append({
+                    "type": "server_tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": getattr(block, "input", {}),
+                })
+            elif block.type == "web_search_tool_result":
+                assistant_content.append({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": block.tool_use_id,
+                    "content": [
+                        {
+                            "type": sr.type,
+                            "url": sr.url,
+                            "title": sr.title,
+                            "encrypted_content": sr.encrypted_content,
+                        }
+                        for sr in block.content
+                        if hasattr(sr, "encrypted_content")
+                    ],
                 })
 
         # Extract usage from final message
@@ -366,6 +400,10 @@ def _tool_summary(tool_name: str, tool_input: dict) -> str:
 
     if tool_name == "request_gate_review":
         return "A solicitar revisao do jornalista"
+
+    if tool_name == "web_search":
+        query = tool_input.get("query", "")
+        return f"A pesquisar na web: {query}" if query else "A pesquisar na web"
 
     return f"A executar {tool_name}"
 

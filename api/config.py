@@ -33,6 +33,7 @@ class Settings(BaseSettings):
 
     # Stage-specific model overrides (optional)
     analysis_model: str = ""  # Defaults to Sonnet 4.6 if not set
+    drafting_model: str = ""  # Defaults to Opus 4.6 if not set
 
     # CORS
     cors_origins: str = "http://localhost:5180,https://parlamentor-web.onrender.com"
