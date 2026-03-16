@@ -620,28 +620,39 @@ def build_tool_registry(
     return tool_defs, handlers
 
 
-def build_analysis_tool_registry(
+def build_research_tool_registry(
+    parla_session_factory: async_sessionmaker,
     app_db: AsyncSession,
     investigation_id: uuid.UUID,
     stage: str,
 ) -> tuple[list[dict], dict[str, callable]]:
-    """Build tool registry for the Analysis stage (only request_gate_review).
+    """Build minimal tool registry for research revision (escape hatch only).
 
-    Returns (tool_definitions, tool_handlers) where tool_handlers maps
-    tool name -> async callable(params) -> dict.
+    Only includes raw_query, describe_table, and request_gate_review.
+    The typed search tools (search_initiatives, search_votes, search_deputies)
+    are excluded because pre-fetched data is already in the system prompt.
     """
-    tool_defs = [TOOL_DEFINITIONS["request_gate_review"]]
+    tool_defs = [
+        TOOL_DEFINITIONS["describe_table"],
+        TOOL_DEFINITIONS["raw_query"],
+        TOOL_DEFINITIONS["request_gate_review"],
+    ]
+
+    async def _describe_table(params: dict) -> dict:
+        async with parla_session_factory() as parla_db:
+            return await handle_describe_table(params, parla_db, app_db, investigation_id, stage)
+
+    async def _raw_query(params: dict) -> dict:
+        async with parla_session_factory() as parla_db:
+            return await handle_raw_query(params, parla_db, app_db, investigation_id, stage)
 
     async def _request_gate_review(params: dict) -> dict:
-        return {
-            "status": "gate_review_requested",
-            "message": (
-                "Analysis review has been requested. You must now produce your final structured "
-                "AnalysisOutput with: executive_summary, findings, and meta notes."
-            ),
-            "summary": params.get("summary", ""),
-        }
+        return await handle_request_gate_review(params)
 
-    handlers = {"request_gate_review": _request_gate_review}
+    handlers = {
+        "describe_table": _describe_table,
+        "raw_query": _raw_query,
+        "request_gate_review": _request_gate_review,
+    }
 
     return tool_defs, handlers

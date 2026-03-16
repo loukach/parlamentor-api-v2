@@ -44,7 +44,7 @@ from api.drafting import (
     DRAFTING_THINKING,
     build_drafting_prompt,
 )
-from api.tools import build_tool_registry, build_analysis_tool_registry
+from api.tools import build_research_tool_registry
 from api.tracing import TraceContext
 
 from sqlalchemy import select, text
@@ -307,25 +307,23 @@ async def _run_analysis_stage(
     # Build prompt
     system_prompt = await build_analysis_prompt(dossier_output, feedback)
 
-    # Build tools (only request_gate_review)
+    # Run agent in skill mode (single call, no tools)
     async with app_session_factory() as app_db:
-        tool_defs, tool_handlers = build_analysis_tool_registry(app_db, investigation_id, "analysis")
-
-        # Run agent
         agent_gen = run_agent(
             model=ANALYSIS_MODEL,
             system_prompt=system_prompt,
             messages=await _load_conversation(app_db, investigation_id, "analysis"),
-            tools=tool_defs,
-            tool_handlers=tool_handlers,
+            tools=[],
+            tool_handlers={},
             thinking=ANALYSIS_THINKING,
             output_schema=ANALYSIS_SCHEMA["schema"],
             cancel_event=cancel_event,
             trace=trace,
+            skill_mode=True,
         )
 
         structured_output, total_usage, assistant_text = await _stream_agent_events(
-            websocket, agent_gen, gate_requested_at_start=False
+            websocket, agent_gen, gate_requested_at_start=True
         )
 
         if structured_output:
@@ -624,36 +622,53 @@ async def _handle_message(
                 topic, prefetch_data=prefetch_data, feedback=feedback
             )
 
-            # Step 3: Run Sonnet analysis (skill mode — single call)
-            # Keep raw_query + describe_table as escape hatch
+            # Step 3: Run Sonnet analysis
             async with app_session_factory() as app_db:
-                tool_defs, tool_handlers = build_tool_registry(
-                    parla_session_factory, app_db, investigation_id, current_stage
-                )
-
-                # Web search tool (server-side)
-                web_search_tool = {
-                    "type": "web_search_20250305",
-                    "name": "web_search",
-                    "max_uses": 3,
-                }
-
-                agent_gen = run_agent(
-                    model=model,
-                    system_prompt=system_prompt,
-                    messages=messages,
-                    tools=tool_defs,
-                    tool_handlers=tool_handlers,
-                    thinking={"type": "enabled", "budget_tokens": 10000},
-                    output_schema=DOSSIER_SCHEMA["schema"],
-                    cancel_event=cancel_event,
-                    trace=trace,
-                    server_tools=[web_search_tool],
-                )
-
-                structured_output, total_usage, assistant_prose = await _stream_agent_events(
-                    websocket, agent_gen, gate_requested_at_start=False
-                )
+                if is_first_run:
+                    # Skill mode — single call, no tools. Pre-fetched data in prompt.
+                    agent_gen = run_agent(
+                        model=model,
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=[],
+                        tool_handlers={},
+                        thinking={"type": "enabled", "budget_tokens": 10000},
+                        output_schema=DOSSIER_SCHEMA["schema"],
+                        cancel_event=cancel_event,
+                        trace=trace,
+                        skill_mode=True,
+                    )
+                    structured_output, total_usage, assistant_prose = await _stream_agent_events(
+                        websocket, agent_gen, gate_requested_at_start=True
+                    )
+                    # Save executive summary as assistant message for revision context
+                    if structured_output:
+                        assistant_prose = structured_output.get("executive_summary", "")
+                else:
+                    # Revision mode — escape hatch tools + web search
+                    tool_defs, tool_handlers = build_research_tool_registry(
+                        parla_session_factory, app_db, investigation_id, current_stage
+                    )
+                    web_search_tool = {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": 3,
+                    }
+                    agent_gen = run_agent(
+                        model=model,
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=tool_defs,
+                        tool_handlers=tool_handlers,
+                        thinking={"type": "enabled", "budget_tokens": 10000},
+                        output_schema=DOSSIER_SCHEMA["schema"],
+                        cancel_event=cancel_event,
+                        trace=trace,
+                        server_tools=[web_search_tool],
+                    )
+                    structured_output, total_usage, assistant_prose = await _stream_agent_events(
+                        websocket, agent_gen, gate_requested_at_start=False
+                    )
 
                 # Add keyword expansion usage to totals
                 if kw_usage:
