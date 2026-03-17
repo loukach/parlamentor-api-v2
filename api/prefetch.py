@@ -104,40 +104,43 @@ async def batch_fetch(
     """
     from sqlalchemy import text
 
-    # Build ILIKE patterns from keywords (stem-friendly partial matching)
-    ilike_patterns = []
-    for kw in keywords:
-        # Extract root for partial matching (e.g. 'habitacao' -> 'habitac')
-        root = kw.lower()
-        if len(root) > 5:
-            root = root[:len(root) - 2]  # rough stemming
-        ilike_patterns.append(f"%{root}%")
+    # Build phrase queries from keywords (OR logic for better recall)
+    # Use phraseto_tsquery for each keyword to match exact phrases
+    # Then combine with OR (||) to allow matching any of the phrases
+    phrase_params = []
+    for i, kw in enumerate(keywords[:10]):  # Use up to 10 keywords
+        if kw.strip():
+            phrase_params.append((f"kw_{i}", kw))
 
-    # Build the tsquery from topic + keywords
-    ts_terms = " ".join([topic] + keywords[:5])
+    # Fallback: if no keywords, use topic
+    if not phrase_params:
+        phrase_params.append(("kw_topic", topic))
+
+    # Build the OR-combined tsquery expression using parameterized queries
+    tsquery_parts = [f"phraseto_tsquery('portuguese', :{ param[0]})" for param in phrase_params]
+    tsquery_or = " || ".join(tsquery_parts)
 
     async def _fetch_initiatives(session):
-        """Fetch initiatives matching keywords, ranked by relevance."""
-        # Build OR conditions for ILIKE
-        ilike_conditions = " OR ".join(
-            f"title ILIKE :pat_{i}" for i in range(len(ilike_patterns))
-        )
-        bind = {f"pat_{i}": p for i, p in enumerate(ilike_patterns)}
-        bind["ts_query"] = ts_terms
-        bind["legislature"] = "XVII"
+        """Fetch initiatives matching keywords, ranked by relevance.
+
+        Uses phrase-based full-text search with OR logic:
+        - Each keyword becomes a phrase query via phraseto_tsquery
+        - Phrases are combined with OR (||) to match any phrase
+        - Results ranked by ts_rank (relevance score)
+        - No legislature filter - searches across all legislatures
+        """
+        bind = {param[0]: param[1] for param in phrase_params}
 
         sql = f"""
-            SELECT ini_id, title, type_description, author_name, current_status,
+            SELECT ini_id, title, type_description, author_name, current_status, legislature,
                    COALESCE(llm_summary, summary) AS summary,
                    ts_rank(
                        to_tsvector('portuguese', title || ' ' || COALESCE(summary, '')),
-                       plainto_tsquery('portuguese', :ts_query)
+                       {tsquery_or}
                    ) AS rank
             FROM iniciativas
-            WHERE legislature = :legislature
-              AND ({ilike_conditions}
-                   OR to_tsvector('portuguese', title || ' ' || COALESCE(summary, ''))
-                      @@ plainto_tsquery('portuguese', :ts_query))
+            WHERE to_tsvector('portuguese', title || ' ' || COALESCE(summary, ''))
+                  @@ ({tsquery_or})
             ORDER BY rank DESC
             LIMIT 100
         """
