@@ -29,14 +29,14 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 | `api/models/__init__.py` | 9 SQLAlchemy models (Investigation, Stage, StageOutput, StateSnapshot, GateLog, AgentLog, Message, QueryLog, ResearchAssets) |
 | `api/routes.py` | REST endpoints (CRUD investigations, stages, messages, stage outputs, research assets) |
 | `api/schemas.py` | Pydantic request/response schemas |
-| `api/orchestrator.py` | State machine (3 stages), gate logic (approve/revise/reject), cost logging |
+| `api/orchestrator.py` | State machine (3 stages), gate logic (research: simplified advance; analysis: approve/revise/reject), cost logging |
 | `api/executor.py` | Agent loop (async generator), streaming, tool dispatch, structured extraction, server tool support |
 | `api/prefetch.py` | Pre-fetch pipeline: Haiku keyword expansion + batch SQL (initiatives, votes, diplomas) |
 | `api/research.py` | Research analyst config: system prompt, DossierOutput schema (with diplomas, media_signals) |
 | `api/analysis.py` | Analysis config: merged findings + story angles, AnalysisOutput schema |
 | `api/drafting.py` | Drafting config: Opus skill mode, DraftOutput schema, chat-based iteration |
 | `api/tools.py` | DB tools + registries: `build_tool_registry` (all 6), `build_research_tool_registry` (escape hatch: raw_query, describe_table, request_gate_review) |
-| `api/ws.py` | WebSocket endpoint `/ws/chat/{id}`: message handling, gate decisions, prefetch, 3 stage handlers |
+| `api/ws.py` | WebSocket endpoint `/ws/chat/{id}`: message handling, gate decisions, prefetch, 3 stage handlers, `assets_updated` event |
 | `api/costs.py` | Anthropic pricing table, cost calculation with cache pricing |
 | `api/tracing.py` | Langfuse TraceContext: span/generation/tool call logging |
 | `scripts/validate_architecture.py` | 5 validation tests (structured output, caching, Langfuse, extraction, tools) |

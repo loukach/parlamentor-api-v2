@@ -165,7 +165,7 @@ ANALYSIS_SCHEMA = {
         "properties": {
             "executive_summary": {
                 "type": "string",
-                "description": "1 paragraph (3-5 sentences) overview of the most significant findings.",
+                "description": "1 paragraph (3-5 sentences) summarizing the key editorial conclusions: what contradictions, patterns, or anomalies did the analysis uncover, and why do they matter journalistically. Do NOT re-summarize the research dossier data — focus on the analytical insights and their newsworthiness.",
             },
             "findings": {
                 "type": "array",

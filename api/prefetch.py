@@ -58,8 +58,14 @@ async def expand_keywords(topic: str) -> tuple[list[str], dict]:
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    # Parse keywords from response
+    # Parse keywords from response (strip markdown fences if present)
     text = response.content[0].text.strip()
+    if text.startswith("```"):
+        # Remove ```json ... ``` fences
+        lines = text.split("\n")
+        text = "\n".join(
+            line for line in lines if not line.strip().startswith("```")
+        ).strip()
     try:
         keywords = json.loads(text)
         if not isinstance(keywords, list):

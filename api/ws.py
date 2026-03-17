@@ -6,7 +6,7 @@ Protocol:
   Client -> Server: message, gate_decision, cancel
   Server -> Client: connected, text_delta, thinking, tool_call, tool_result,
                     usage, stage_output, gate_ready, gate_result,
-                    stage_started, turn_complete, error
+                    stage_started, assets_updated, turn_complete, error
 """
 
 import asyncio
@@ -407,6 +407,9 @@ async def _run_drafting_stage(
 
         import json as json_module
         metadata = json_module.loads(gate.rationale)
+        # Handle double-serialized JSON (string instead of dict)
+        if isinstance(metadata, str):
+            metadata = json_module.loads(metadata)
         selected_angle_id = metadata.get("selected_angle_id")
 
         # Load analysis output and find selected angle
@@ -470,6 +473,15 @@ async def _run_drafting_stage(
                 "output": structured_output,
             })
 
+            # Stream completion message to chat (skill mode suppresses text_delta)
+            word_count = structured_output.get("word_count", 0)
+            completion_msg = (
+                f"O rascunho esta pronto ({word_count} palavras). "
+                "Reveja o artigo no separador Rascunho e envie feedback para ajustes."
+            )
+            await _send(websocket, {"type": "text_delta", "content": completion_msg})
+            assistant_text = completion_msg
+
             trace_output = structured_output.get("title", "")
         else:
             trace_output = assistant_text
@@ -529,6 +541,16 @@ async def _handle_message(
             )
             if stage_info and stage_info["status"] == "pending":
                 await start_stage(app_db, investigation_id, current_stage)
+            elif stage_info and stage_info["status"] == "gate_pending":
+                # User sent a message during gate review (research iteration)
+                from sqlalchemy import update as sql_update
+                from api.models import Stage
+                await app_db.execute(
+                    sql_update(Stage)
+                    .where(Stage.investigation_id == investigation_id, Stage.stage == current_stage)
+                    .values(status="active")
+                )
+                await app_db.commit()
 
             # Persist user message
             user_msg = Message(
@@ -616,6 +638,8 @@ async def _handle_message(
                         await _upsert_research_assets(
                             app_db2, investigation_id, hydrated_inis, hydrated_votes
                         )
+                    # Notify frontend to refresh assets panel immediately
+                    await _send(websocket, {"type": "assets_updated"})
 
             # Step 2: Build prompt with pre-fetched data
             system_prompt = await build_research_prompt(
@@ -692,6 +716,7 @@ async def _handle_message(
                             await _upsert_research_assets(
                                 app_db2, investigation_id, inis, vts
                             )
+                        await _send(websocket, {"type": "assets_updated"})
 
                     await _send(websocket, {
                         "type": "stage_output",
@@ -699,6 +724,7 @@ async def _handle_message(
                         "output": structured_output,
                     })
 
+                    # Gate: journalist reviews research before advancing
                     summary = structured_output.get("executive_summary", "")[:200]
                     await _send(websocket, {
                         "type": "gate_ready",
@@ -706,7 +732,21 @@ async def _handle_message(
                         "summary": summary,
                     })
 
-                    trace_output = structured_output.get("executive_summary", "")
+                    # Format assistant message with markdown
+                    exec_summary = structured_output.get("executive_summary", "")
+                    assistant_prose = (
+                        exec_summary
+                        + "\n\n---\n\n"
+                        + "**Próximos passos:** Reveja o dossier completo no painel à direita. "
+                        + "Pode refinar a pesquisa enviando uma mensagem, "
+                        + "ou avançar para a análise editorial."
+                    )
+                    await _send(websocket, {
+                        "type": "text_delta",
+                        "content": assistant_prose,
+                    })
+
+                    trace_output = exec_summary
                 else:
                     trace_output = assistant_prose
 
