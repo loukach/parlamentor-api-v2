@@ -1,13 +1,17 @@
-"""Cost calculation for Anthropic API calls."""
+"""Cost calculation for Anthropic API calls.
+
+Local estimate only — actual billing may differ due to thinking token
+summarization in Claude 4 models. Use Anthropic Console for exact costs.
+"""
 
 from decimal import Decimal
 
-# Pricing per million tokens (USD)
-# Source: https://docs.anthropic.com/en/docs/about-claude/models
+# Pricing per million tokens (USD) — updated 2026-03-18
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
 PRICING: dict[str, dict[str, Decimal]] = {
     "claude-opus-4-6": {
-        "input": Decimal("15.00"),
-        "output": Decimal("75.00"),
+        "input": Decimal("5.00"),
+        "output": Decimal("25.00"),
     },
     "claude-sonnet-4-5-20250929": {
         "input": Decimal("3.00"),
@@ -18,8 +22,8 @@ PRICING: dict[str, dict[str, Decimal]] = {
         "output": Decimal("15.00"),
     },
     "claude-haiku-4-5-20251001": {
-        "input": Decimal("0.80"),
-        "output": Decimal("4.00"),
+        "input": Decimal("1.00"),
+        "output": Decimal("5.00"),
     },
 }
 
