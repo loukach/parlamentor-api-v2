@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.auth import get_current_user
 from api.db import get_app_db
 from api.models import Investigation, Message, ResearchAssets, Stage, StageOutput
 from api.schemas import (
@@ -24,9 +25,22 @@ router = APIRouter(prefix="/api")
 STAGES = ["research", "analysis", "drafting"]
 
 
+async def get_authorized_investigation(db: AsyncSession, investigation_id: uuid.UUID, user_id: str) -> Investigation:
+    """Fetch investigation and verify ownership. Raises 404/403."""
+    result = await db.execute(select(Investigation).where(Investigation.id == investigation_id))
+    investigation = result.scalar()
+    if not investigation:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    if investigation.user_id is not None and investigation.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return investigation
+
+
 @router.post("/investigations", response_model=InvestigationResponse, status_code=201)
 async def create_investigation(
-    data: InvestigationCreate, db: AsyncSession = Depends(get_app_db)
+    data: InvestigationCreate,
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
 ):
     # Generate slug from topic
     base_slug = slugify(data.topic, max_length=100)
@@ -41,7 +55,11 @@ async def create_investigation(
             async with db.begin_nested():
                 # Create investigation
                 investigation = Investigation(
-                    topic=data.topic, slug=slug, status="active", current_stage="research"
+                    topic=data.topic,
+                    slug=slug,
+                    status="active",
+                    current_stage="research",
+                    user_id=user_id,
                 )
                 db.add(investigation)
                 await db.flush()
@@ -70,28 +88,35 @@ async def create_investigation(
 
 
 @router.get("/investigations", response_model=list[InvestigationResponse])
-async def list_investigations(db: AsyncSession = Depends(get_app_db)):
+async def list_investigations(
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
+):
     result = await db.execute(
-        select(Investigation).order_by(Investigation.created_at.desc())
+        select(Investigation)
+        .where(Investigation.user_id == user_id)
+        .order_by(Investigation.created_at.desc())
     )
     return result.scalars().all()
 
 
 @router.get("/investigations/{investigation_id}", response_model=InvestigationResponse)
-async def get_investigation(investigation_id: uuid.UUID, db: AsyncSession = Depends(get_app_db)):
-    result = await db.execute(select(Investigation).where(Investigation.id == investigation_id))
-    investigation = result.scalar()
-    if not investigation:
-        raise HTTPException(status_code=404, detail="Investigation not found")
+async def get_investigation(
+    investigation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
+):
+    investigation = await get_authorized_investigation(db, investigation_id, user_id)
     return investigation
 
 
 @router.delete("/investigations/{investigation_id}", status_code=204)
-async def delete_investigation(investigation_id: uuid.UUID, db: AsyncSession = Depends(get_app_db)):
-    result = await db.execute(select(Investigation).where(Investigation.id == investigation_id))
-    investigation = result.scalar()
-    if not investigation:
-        raise HTTPException(status_code=404, detail="Investigation not found")
+async def delete_investigation(
+    investigation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
+):
+    investigation = await get_authorized_investigation(db, investigation_id, user_id)
     await db.delete(investigation)
     await db.commit()
 
@@ -101,9 +126,14 @@ async def delete_investigation(investigation_id: uuid.UUID, db: AsyncSession = D
     response_model=StageOutputResponse | None,
 )
 async def get_stage_output(
-    investigation_id: uuid.UUID, stage: str, db: AsyncSession = Depends(get_app_db)
+    investigation_id: uuid.UUID,
+    stage: str,
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
 ):
     """Get latest stage output. Returns None if no output exists yet."""
+    await get_authorized_investigation(db, investigation_id, user_id)
+
     result = await db.execute(
         select(StageOutput)
         .where(
@@ -120,9 +150,13 @@ async def get_stage_output(
     response_model=list[StageResponse],
 )
 async def list_stages(
-    investigation_id: uuid.UUID, db: AsyncSession = Depends(get_app_db)
+    investigation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
 ):
     """Get all stages for an investigation."""
+    await get_authorized_investigation(db, investigation_id, user_id)
+
     result = await db.execute(
         select(Stage).where(Stage.investigation_id == investigation_id)
     )
@@ -138,8 +172,11 @@ async def list_messages(
     investigation_id: uuid.UUID,
     limit: int = 200,
     db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
 ):
     """Get messages for an investigation, ordered by creation time."""
+    await get_authorized_investigation(db, investigation_id, user_id)
+
     result = await db.execute(
         select(Message)
         .where(Message.investigation_id == investigation_id)
@@ -154,9 +191,13 @@ async def list_messages(
     response_model=ResearchAssetsResponse,
 )
 async def get_research_assets(
-    investigation_id: uuid.UUID, db: AsyncSession = Depends(get_app_db)
+    investigation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_app_db),
+    user_id: str = Depends(get_current_user),
 ):
     """Get accumulated research assets (initiatives + votes) for an investigation."""
+    await get_authorized_investigation(db, investigation_id, user_id)
+
     result = await db.execute(
         select(ResearchAssets).where(ResearchAssets.investigation_id == investigation_id)
     )

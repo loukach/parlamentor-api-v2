@@ -16,10 +16,11 @@ import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from api.auth import validate_ws_token
 from api.config import DEFAULT_MODEL
 from api.db import app_session_factory, parla_session_factory
 from api.executor import run_agent
-from api.models import Message, ResearchAssets
+from api.models import Investigation, Message, ResearchAssets
 from api.orchestrator import (
     get_state,
     log_api_call,
@@ -57,6 +58,29 @@ ws_router = APIRouter()
 @ws_router.websocket("/ws/chat/{investigation_id}")
 async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
     await websocket.accept()
+
+    # Validate JWT token from query params
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001, reason="Missing authentication token")
+        return
+
+    try:
+        user_id = validate_ws_token(token)
+    except ValueError as e:
+        await websocket.close(code=4003, reason=str(e))
+        return
+
+    # Verify investigation belongs to user
+    async with app_session_factory() as db:
+        result = await db.execute(select(Investigation).where(Investigation.id == investigation_id))
+        investigation = result.scalar()
+        if not investigation:
+            await websocket.close(code=4004, reason="Investigation not found")
+            return
+        if investigation.user_id is not None and investigation.user_id != user_id:
+            await websocket.close(code=4003, reason="Access denied")
+            return
 
     # Agent task handle (for cancellation)
     agent_task: asyncio.Task | None = None

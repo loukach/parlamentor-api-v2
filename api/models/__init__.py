@@ -24,6 +24,7 @@ class Investigation(Base):
     slug: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     current_stage: Mapped[str] = mapped_column(String(20), nullable=False, default="research")
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     analysis_model: str = ""  # Defaults to Sonnet 4.6 if not set
     drafting_model: str = ""  # Defaults to Opus 4.6 if not set
 
+    # Nhost
+    nhost_subdomain: str = ""
+    nhost_region: str = "eu-central-1"
+
     # CORS
     cors_origins: str = "http://localhost:5180,https://parlamentor-web.onrender.com"
 
