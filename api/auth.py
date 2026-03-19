@@ -1,6 +1,6 @@
 """Nhost JWT authentication."""
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthCredentials
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import jwt
 from jwt import PyJWKClient
 
@@ -20,7 +20,7 @@ def _get_jwks_client() -> PyJWKClient:
 
 _security = HTTPBearer(auto_error=False)
 
-def get_current_user(credentials: HTTPAuthCredentials | None = Depends(_security)) -> str:
+def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(_security)) -> str:
     """Extract user_id from Nhost JWT. Returns the Nhost user UUID."""
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
