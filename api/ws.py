@@ -132,15 +132,6 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                     kickoff = "Iniciar fase: drafting"
 
                     try:
-                        async with app_session_factory() as db:
-                            db.add(Message(
-                                investigation_id=investigation_id,
-                                stage=next_stage,
-                                role="user",
-                                content=kickoff
-                            ))
-                            await db.commit()
-
                         # Send stage_started
                         await _send(websocket, {
                             "type": "stage_started",
@@ -346,6 +337,8 @@ async def _run_analysis_stage(
             })
 
             trace_output = structured_output.get("executive_summary", "")
+            # Save executive summary as assistant message for chat history
+            assistant_text = structured_output.get("executive_summary", "")
         else:
             trace_output = assistant_text
 
