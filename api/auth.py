@@ -6,7 +6,10 @@ from jwt import PyJWKClient
 
 from api.config import settings
 
-_jwks_url = f"https://{settings.nhost_subdomain}.auth.{settings.nhost_region}.nhost.run/v1/jwks"
+_jwks_url = (
+    settings.nhost_jwks_url
+    or f"https://{settings.nhost_subdomain}.auth.{settings.nhost_region}.nhost.run/v1/.well-known/jwks.json"
+)
 _jwks_client: PyJWKClient | None = None
 
 def _get_jwks_client() -> PyJWKClient:
