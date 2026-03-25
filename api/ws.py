@@ -125,11 +125,28 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                 await websocket.close()
                 return
 
+        current_stage_on_connect = state["investigation"]["current_stage"]
         await _send(websocket, {
             "type": "connected",
             "investigation_id": str(investigation_id),
-            "current_stage": state["investigation"]["current_stage"],
+            "current_stage": current_stage_on_connect,
         })
+
+        # Auto-resume analysis if it was interrupted (stage active, no output yet)
+        stage_on_connect = next(
+            (s for s in state["stages"] if s["stage"] == current_stage_on_connect), None
+        )
+        if (
+            current_stage_on_connect == "analysis"
+            and stage_on_connect
+            and stage_on_connect["status"] == "active"
+            and not state["outputs"].get("analysis")
+        ):
+            cancel_event.clear()
+            agent_task = asyncio.create_task(
+                _handle_message(websocket, investigation_id, "Iniciar fase: analysis", DEFAULT_MODEL, cancel_event)
+            )
+            timeout_task = asyncio.create_task(_timeout_watchdog(agent_task))
 
         while True:
             raw = await websocket.receive_text()
@@ -150,10 +167,10 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                     websocket, investigation_id, msg
                 )
 
-                # Auto-start drafting after analysis approval (angle selected)
-                if gate_result and gate_result.get("next_stage") == "drafting":
-                    next_stage = "drafting"
-                    kickoff = "Iniciar fase: drafting"
+                # Auto-start analysis after research approval, or drafting after analysis approval
+                next_stage = gate_result.get("next_stage") if gate_result else None
+                if next_stage in ("analysis", "drafting"):
+                    kickoff = f"Iniciar fase: {next_stage}"
 
                     try:
                         # Send stage_started
@@ -169,10 +186,10 @@ async def websocket_chat(websocket: WebSocket, investigation_id: uuid.UUID):
                         timeout_task = asyncio.create_task(_timeout_watchdog(agent_task))
 
                     except Exception:
-                        logger.exception("Drafting auto-start failed for %s", investigation_id)
+                        logger.exception("%s auto-start failed for %s", next_stage, investigation_id)
                         await _send(websocket, {
                             "type": "error",
-                            "content": "A fase de rascunho falhou. Envie uma mensagem para tentar novamente."
+                            "content": f"A fase de {next_stage} falhou. Envie uma mensagem para tentar novamente."
                         })
 
             else:
@@ -851,12 +868,7 @@ async def _handle_gate_decision(
             "next_stage": result.get("next_stage"),
         })
 
-        # Only send stage_started if NOT auto-starting (auto-start handles this)
-        if result.get("next_stage") and result["next_stage"] != "drafting":
-            await _send(websocket, {
-                "type": "stage_started",
-                "stage": result["next_stage"],
-            })
+        # stage_started is sent by the auto-start block in the caller for analysis/drafting
 
         return result
 
@@ -925,7 +937,7 @@ async def _hydrate_assets(
     # Fetch initiatives with latest vote
     ini_sql = f"""
         SELECT i.id, i.ini_id, i.number, i.title, i.type_description, i.author_name,
-               i.current_status, i.legislature,
+               i.current_status, i.legislature, i.citizen_status,
                COALESCE(i.llm_summary, i.summary) AS summary,
                v.resultado AS vote_result, v.favor, v.contra, v.abstencao, v.vote_date
         FROM iniciativas i
@@ -956,6 +968,7 @@ async def _hydrate_assets(
             "contra": r["contra"],
             "abstencao": r["abstencao"],
             "vote_date": str(r["vote_date"]) if r["vote_date"] else None,
+            "citizen_status": r["citizen_status"],
         }
         for r in ini_rows
     ]
