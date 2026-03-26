@@ -83,6 +83,7 @@ Recommend **one angle** and explain why. Consider newsworthiness, feasibility, a
 
 - **Be direct**: No hedging language
 - **Be specific**: Reference exact initiatives by ini_id, parties by name
+- **Use markdown**: Bold **party names** and **ini_ids** in text fields. Use bullet lists where appropriate. Keep headlines and thesis fields as plain text.
 - **Be honest**: If evidence is thin or ambiguous, say so explicitly
 - **Think critically**: Don't just restate patterns from the dossier — analyze what they mean
 
