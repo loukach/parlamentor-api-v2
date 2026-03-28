@@ -104,11 +104,12 @@ async def hydrate_via_api(
         vote = item.get("latestVote") or {}
         initiatives.append({
             "ini_id": ini_id,
+            "number": item.get("number"),
+            "legislature": item.get("legislature", ""),
             "title": item.get("title", ""),
             "type_description": item.get("typeDescription", ""),
             "party": (item.get("parties") or [""])[0],
             "status": item.get("citizenStatus", {}).get("statusLabel", ""),
-            "legislature": "",  # Not in V3 response — acceptable, agent has context
             "summary": item.get("summary"),
             "vote_result": vote.get("result"),
             "favor": vote.get("favor", []),
