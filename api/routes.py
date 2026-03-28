@@ -11,11 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.auth import get_current_user
 from api.db import get_app_db
 from api.models import Investigation, Message, ResearchAssets, Stage, StageOutput
+from api.email import send_share_email
 from api.schemas import (
     InvestigationCreate,
     InvestigationResponse,
     MessageResponse,
     ResearchAssetsResponse,
+    ShareArtifactRequest,
+    ShareArtifactResponse,
     StageOutputResponse,
     StageResponse,
 )
@@ -205,3 +208,20 @@ async def get_research_assets(
     if not row:
         return ResearchAssetsResponse(initiatives=[], votes=[])
     return ResearchAssetsResponse(initiatives=row.initiatives or [], votes=row.votes or [])
+
+
+@router.post("/share-artifact", response_model=ShareArtifactResponse)
+async def share_artifact(
+    data: ShareArtifactRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Send a branded email sharing an investigation artifact."""
+    success = await send_share_email(
+        to_email=data.to_email,
+        artifact_type=data.artifact_type,
+        content=data.content,
+        topic=data.investigation_topic,
+    )
+    if not success:
+        raise HTTPException(status_code=502, detail="Falha ao enviar email")
+    return ShareArtifactResponse(status="sent", to=data.to_email)

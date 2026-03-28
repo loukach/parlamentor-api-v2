@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Viriato (Parla!) API for semantic search
     viriato_api_url: str = "https://viriato-api.onrender.com"
 
+    # Resend (email)
+    resend_api_key: str = ""
+    resend_share_template_id: str = ""
+    frontend_url: str = "https://parlamentor-web.onrender.com"
+
     # CORS
     cors_origins: str = "http://localhost:5180,https://parlamentor-web.onrender.com"
 

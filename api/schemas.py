@@ -60,3 +60,15 @@ class StageOutputResponse(BaseModel):
 class ResearchAssetsResponse(BaseModel):
     initiatives: list[dict]
     votes: list[dict]
+
+
+class ShareArtifactRequest(BaseModel):
+    to_email: str = Field(...)
+    artifact_type: str = Field(...)  # initiatives|research|analysis|drafting
+    content: str = Field(...)
+    investigation_topic: str = Field(..., max_length=500)
+
+
+class ShareArtifactResponse(BaseModel):
+    status: str
+    to: str
