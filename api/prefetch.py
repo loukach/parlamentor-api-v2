@@ -30,7 +30,7 @@ async def semantic_search(topic: str) -> list[str]:
         async with httpx.AsyncClient(timeout=VIRIATO_SEARCH_TIMEOUT) as client:
             resp = await client.get(
                 f"{api_url}/api/search",
-                params={"q": topic, "limit": 20},
+                params={"q": topic, "limit": 20, "legislature": "all"},
             )
             resp.raise_for_status()
             data = resp.json()
