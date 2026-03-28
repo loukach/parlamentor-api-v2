@@ -34,7 +34,7 @@ async def send_share_email(
             "variables": {
                 "topic": topic[:200],
                 "artifact_label": label,
-                "content": content[:50_000],
+                "content": content[:2_000],
                 "app_url": settings.frontend_url,
             },
         },
