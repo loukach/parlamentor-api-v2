@@ -40,15 +40,21 @@ async def semantic_search(topic: str) -> list[str]:
 
     duration = int((time.monotonic() - t0) * 1000)
 
-    # Extract ini_ids from temas > matchingInitiatives
+    # Extract ini_ids from temas > matchingInitiatives + standalone initiatives
     seen = set()
     ini_ids = []
-    for tema in data.get("results", {}).get("temas", []):
+    results = data.get("results", {})
+    for tema in results.get("temas", []):
         for ini in tema.get("matchingInitiatives", []):
             ini_id = ini.get("iniId")
             if ini_id and ini_id not in seen:
                 seen.add(ini_id)
                 ini_ids.append(ini_id)
+    for ini in results.get("initiatives", []):
+        ini_id = ini.get("iniId")
+        if ini_id and ini_id not in seen:
+            seen.add(ini_id)
+            ini_ids.append(ini_id)
 
     logger.info("Semantic search: %d ini_ids in %dms", len(ini_ids), duration)
     return ini_ids
