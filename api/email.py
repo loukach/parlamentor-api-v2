@@ -1,6 +1,7 @@
 """Email sending via Resend template API."""
 
 import logging
+import re
 
 import httpx
 
@@ -14,6 +15,19 @@ ARTIFACT_LABELS = {
     "analysis": "Analise",
     "drafting": "Rascunho editorial",
 }
+
+
+def _md_to_html(text: str) -> str:
+    """Convert basic markdown to HTML for email rendering."""
+    html = text
+    # Bold: **text** → <strong>text</strong>
+    html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html)
+    # Italic: *text* → <em>text</em>
+    html = re.sub(r"\*(.+?)\*", r"<em>\1</em>", html)
+    # Paragraphs: double newlines
+    paragraphs = html.split("\n\n")
+    html = "".join(f"<p>{p.strip()}</p>" for p in paragraphs if p.strip())
+    return html
 
 
 async def send_share_email(
@@ -34,7 +48,7 @@ async def send_share_email(
             "variables": {
                 "topic": topic[:200],
                 "artifact_label": label,
-                "content": content[:2_000],
+                "content": _md_to_html(content[:2_000]),
                 "app_url": settings.frontend_url,
             },
         },
