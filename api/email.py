@@ -17,8 +17,8 @@ ARTIFACT_LABELS = {
 }
 
 
-def _md_to_html(text: str) -> str:
-    """Convert basic markdown to HTML for email rendering."""
+def _md_to_html(text: str, max_len: int = 2_000) -> str:
+    """Convert basic markdown to HTML for email rendering, respecting char limit."""
     html = text
     # Bold: **text** → <strong>text</strong>
     html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html)
@@ -26,8 +26,23 @@ def _md_to_html(text: str) -> str:
     html = re.sub(r"\*(.+?)\*", r"<em>\1</em>", html)
     # Paragraphs: double newlines
     paragraphs = html.split("\n\n")
-    html = "".join(f"<p>{p.strip()}</p>" for p in paragraphs if p.strip())
-    return html
+    # Build up paragraphs until we hit the limit
+    parts: list[str] = []
+    length = 0
+    for p in paragraphs:
+        stripped = p.strip()
+        if not stripped:
+            continue
+        wrapped = f"<p>{stripped}</p>"
+        if length + len(wrapped) > max_len:
+            # Include a truncated version of this paragraph if we have nothing yet
+            if not parts:
+                remaining = max_len - len("<p></p>")
+                parts.append(f"<p>{stripped[:remaining]}</p>")
+            break
+        parts.append(wrapped)
+        length += len(wrapped)
+    return "".join(parts)
 
 
 async def send_share_email(
@@ -48,7 +63,7 @@ async def send_share_email(
             "variables": {
                 "topic": topic[:200],
                 "artifact_label": label,
-                "content": _md_to_html(content[:2_000]),
+                "content": _md_to_html(content),
                 "app_url": settings.frontend_url,
             },
         },
