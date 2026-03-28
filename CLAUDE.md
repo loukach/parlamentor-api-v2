@@ -31,7 +31,7 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 | `api/schemas.py` | Pydantic request/response schemas |
 | `api/orchestrator.py` | State machine (3 stages), gate logic (research: simplified advance; analysis: approve/revise/reject), cost logging |
 | `api/executor.py` | Agent loop (async generator), streaming, tool dispatch, structured extraction, server tool support |
-| `api/prefetch.py` | Pre-fetch pipeline: Haiku keyword expansion + batch SQL (initiatives, votes, diplomas) |
+| `api/prefetch.py` | Pre-fetch pipeline: Viriato API semantic search + batch hydration (no direct DB access) |
 | `api/research.py` | Research analyst config: system prompt, DossierOutput schema (with diplomas, media_signals) |
 | `api/analysis.py` | Analysis config: merged findings + story angles, AnalysisOutput schema |
 | `api/drafting.py` | Drafting config: Opus skill mode, DraftOutput schema, chat-based iteration |

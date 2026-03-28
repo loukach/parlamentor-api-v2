@@ -83,6 +83,10 @@ async def hydrate_via_api(
 
     duration = int((time.monotonic() - t0) * 1000)
 
+    if not isinstance(items, list):
+        logger.warning("Hydration returned unexpected type: %s", type(items).__name__)
+        return [], [], []
+
     initiatives = []
     votes = []
     diplomas = []
