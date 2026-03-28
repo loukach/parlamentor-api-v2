@@ -179,7 +179,7 @@ DOSSIER_SCHEMA = {
         "properties": {
             "executive_summary": {
                 "type": "string",
-                "description": "2-3 paragraphs summarizing the research findings.",
+                "description": "Structured markdown briefing: > blockquote lead, then ### headers with - bullet lists, then --- and closing. See prompt for exact format.",
             },
             "topic_keywords": {
                 "type": "array",
