@@ -45,7 +45,7 @@ class Settings(BaseSettings):
 
     # Resend (email)
     resend_api_key: str = ""
-    resend_share_template_id: str = ""
+    resend_share_template_id: str = "partilha-de-artefactos"
     frontend_url: str = "https://parlamentor-web.onrender.com"
 
     # CORS
