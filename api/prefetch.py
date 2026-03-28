@@ -1,238 +1,139 @@
-"""Pre-fetch pipeline: keyword expansion + batch SQL queries.
+"""Pre-fetch pipeline: semantic search + hydration via Viriato API.
 
-Replaces the 15-25 tool-call agent loop with:
-1. Haiku expands topic into Portuguese search keywords (~$0.001)
-2. System runs 3 parallel SQL queries against Parla DB (~0 cost, <1s)
-3. Data shown in panel instantly, before agent starts analyzing
+All parliamentary data accessed through Viriato API — no direct DB connection.
 
-Returns a ResearchPackage dict with initiatives, votes, diplomas.
+1. semantic_search(topic) — embedding-based initiative discovery
+2. hydrate_via_api(ini_ids) — batch fetch full details (initiatives, votes, diplomas)
 """
 
-import asyncio
-import json
 import logging
 import time
 
-import anthropic
+import httpx
 
 from api.config import settings
-from api.costs import calculate_cost
 
 logger = logging.getLogger(__name__)
 
-_client: anthropic.AsyncAnthropic | None = None
+VIRIATO_SEARCH_TIMEOUT = 8.0  # seconds — can be slow on cold start
+VIRIATO_HYDRATE_TIMEOUT = 10.0
 
 
-def _get_client() -> anthropic.AsyncAnthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    return _client
+async def semantic_search(topic: str) -> list[str]:
+    """Call Viriato /api/search for embedding-based initiative discovery.
 
-
-KEYWORD_MODEL = "claude-haiku-4-5-20251001"
-
-
-async def expand_keywords(topic: str) -> tuple[list[str], dict]:
-    """Use Haiku to expand a topic into 10-15 Portuguese search keywords.
-
-    Returns (keywords, usage_dict) where usage_dict has token counts + cost.
+    Returns deduplicated list of ini_ids. Falls back to empty list on error.
     """
+    api_url = settings.viriato_api_url.rstrip("/")
     t0 = time.monotonic()
-    response = await _get_client().messages.create(
-        model=KEYWORD_MODEL,
-        max_tokens=512,
-        messages=[{"role": "user", "content": topic}],
-        system=[{
-            "type": "text",
-            "text": (
-                "You are a Portuguese parliamentary research assistant. "
-                "Given a topic, produce 10-15 search keywords in Portuguese that cover:\n"
-                "- Direct terms and synonyms\n"
-                "- Legislative/technical terms (e.g. 'projeto de lei', 'proposta de resolucao')\n"
-                "- Related policy areas\n"
-                "- Common abbreviations (e.g. 'IMI', 'IHRU')\n\n"
-                "Output ONLY a JSON array of strings. No explanation."
-            ),
-        }],
-    )
-    duration_ms = int((time.monotonic() - t0) * 1000)
-
-    # Parse keywords from response (strip markdown fences if present)
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        # Remove ```json ... ``` fences
-        lines = text.split("\n")
-        text = "\n".join(
-            line for line in lines if not line.strip().startswith("```")
-        ).strip()
     try:
-        keywords = json.loads(text)
-        if not isinstance(keywords, list):
-            keywords = [topic]
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse keyword expansion, using topic as-is: %s", text)
-        keywords = [topic]
-
-    usage = response.usage
-    input_tokens = usage.input_tokens
-    output_tokens = usage.output_tokens
-    cost = calculate_cost(KEYWORD_MODEL, input_tokens, output_tokens, 0, 0)
-
-    usage_dict = {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cache_read_tokens": 0,
-        "cache_create_tokens": 0,
-        "cost_usd": cost,
-        "duration_ms": duration_ms,
-        "model": KEYWORD_MODEL,
-    }
-
-    logger.info("Keyword expansion: %d keywords in %dms", len(keywords), duration_ms)
-    return keywords, usage_dict
-
-
-async def batch_fetch(
-    parla_session_factory,
-    topic: str,
-    keywords: list[str],
-) -> dict:
-    """Run 3 parallel SQL queries against Parla DB.
-
-    Returns dict with keys: initiatives, votes, diplomas, stats.
-    """
-    from sqlalchemy import text
-
-    # Build phrase queries from keywords (OR logic for better recall)
-    # Use phraseto_tsquery for each keyword to match exact phrases
-    # Then combine with OR (||) to allow matching any of the phrases
-    phrase_params = []
-    for i, kw in enumerate(keywords[:10]):  # Use up to 10 keywords
-        if kw.strip():
-            phrase_params.append((f"kw_{i}", kw))
-
-    # Fallback: if no keywords, use topic
-    if not phrase_params:
-        phrase_params.append(("kw_topic", topic))
-
-    # Build the OR-combined tsquery expression using parameterized queries
-    tsquery_parts = [f"phraseto_tsquery('portuguese', :{ param[0]})" for param in phrase_params]
-    tsquery_or = " || ".join(tsquery_parts)
-
-    async def _fetch_initiatives(session):
-        """Fetch initiatives matching keywords, ranked by relevance.
-
-        Uses phrase-based full-text search with OR logic:
-        - Each keyword becomes a phrase query via phraseto_tsquery
-        - Phrases are combined with OR (||) to match any phrase
-        - Results ranked by ts_rank (relevance score)
-        - No legislature filter - searches across all legislatures
-        """
-        bind = {param[0]: param[1] for param in phrase_params}
-
-        sql = f"""
-            SELECT ini_id, title, type_description, author_name, current_status, legislature,
-                   COALESCE(llm_summary, summary) AS summary,
-                   ts_rank(
-                       to_tsvector('portuguese', title || ' ' || COALESCE(summary, '')),
-                       {tsquery_or}
-                   ) AS rank
-            FROM iniciativas
-            WHERE to_tsvector('portuguese', title || ' ' || COALESCE(summary, ''))
-                  @@ ({tsquery_or})
-            ORDER BY rank DESC
-            LIMIT 100
-        """
-        t0 = time.monotonic()
-        result = await session.execute(text(sql), bind)
-        rows = result.mappings().all()
-        duration = int((time.monotonic() - t0) * 1000)
-        logger.info("Prefetch initiatives: %d rows in %dms", len(rows), duration)
-        return [dict(r) for r in rows]
-
-    async def _fetch_votes(session, ini_ids: list[str]):
-        """Fetch votes for matched initiatives."""
-        if not ini_ids:
-            return []
-        placeholders = ", ".join(f":id_{i}" for i in range(len(ini_ids)))
-        bind = {f"id_{i}": v for i, v in enumerate(ini_ids)}
-
-        sql = f"""
-            SELECT v.id, v.iniciativa_id, i.ini_id, i.title, i.author_name,
-                   v.phase_name, v.vote_date, v.resultado, v.unanime,
-                   v.favor, v.contra, v.abstencao
-            FROM votes v
-            JOIN iniciativas i ON i.id = v.iniciativa_id
-            WHERE i.ini_id IN ({placeholders})
-            ORDER BY v.vote_date DESC NULLS LAST
-        """
-        t0 = time.monotonic()
-        result = await session.execute(text(sql), bind)
-        rows = result.mappings().all()
-        duration = int((time.monotonic() - t0) * 1000)
-        logger.info("Prefetch votes: %d rows in %dms", len(rows), duration)
-        return [dict(r) for r in rows]
-
-    async def _fetch_diplomas(session, ini_ids: list[str]):
-        """Fetch diplomas for matched initiatives."""
-        if not ini_ids:
-            return []
-        placeholders = ", ".join(f":id_{i}" for i in range(len(ini_ids)))
-        bind = {f"id_{i}": v for i, v in enumerate(ini_ids)}
-
-        sql = f"""
-            SELECT d.id, d.tipo, d.numero, d.titulo, d.pub_date,
-                   di.ini_id
-            FROM diplomas d
-            JOIN diploma_iniciativas di ON di.diploma_id = d.id
-            WHERE di.ini_id IN ({placeholders})
-            ORDER BY d.pub_date DESC NULLS LAST
-        """
-        t0 = time.monotonic()
-        result = await session.execute(text(sql), bind)
-        rows = result.mappings().all()
-        duration = int((time.monotonic() - t0) * 1000)
-        logger.info("Prefetch diplomas: %d rows in %dms", len(rows), duration)
-        return [dict(r) for r in rows]
-
-    # Step 1: fetch initiatives
-    async with parla_session_factory() as session:
-        initiatives = await _fetch_initiatives(session)
-
-    ini_ids = [r["ini_id"] for r in initiatives if r.get("ini_id")]
-
-    # Step 2: fetch votes + diplomas in parallel
-    async with parla_session_factory() as session_v:
-        async with parla_session_factory() as session_d:
-            votes, diplomas = await asyncio.gather(
-                _fetch_votes(session_v, ini_ids),
-                _fetch_diplomas(session_d, ini_ids),
+        async with httpx.AsyncClient(timeout=VIRIATO_SEARCH_TIMEOUT) as client:
+            resp = await client.get(
+                f"{api_url}/api/search",
+                params={"q": topic, "limit": 20},
             )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        logger.warning("Semantic search failed for topic: %s", topic, exc_info=True)
+        return []
 
-    # Serialize date fields
-    for row in initiatives:
-        for k, v in row.items():
-            if hasattr(v, "isoformat"):
-                row[k] = v.isoformat()
+    duration = int((time.monotonic() - t0) * 1000)
 
-    for row in votes:
-        for k, v in row.items():
-            if hasattr(v, "isoformat"):
-                row[k] = v.isoformat()
+    # Extract ini_ids from temas > matchingInitiatives
+    seen = set()
+    ini_ids = []
+    for tema in data.get("results", {}).get("temas", []):
+        for ini in tema.get("matchingInitiatives", []):
+            ini_id = ini.get("iniId")
+            if ini_id and ini_id not in seen:
+                seen.add(ini_id)
+                ini_ids.append(ini_id)
 
-    for row in diplomas:
-        for k, v in row.items():
-            if hasattr(v, "isoformat"):
-                row[k] = v.isoformat()
+    logger.info("Semantic search: %d ini_ids in %dms", len(ini_ids), duration)
+    return ini_ids
 
-    return {
-        "initiatives": initiatives,
-        "votes": votes,
-        "diplomas": diplomas,
-        "stats": {
-            "initiative_count": len(initiatives),
-            "vote_count": len(votes),
-            "diploma_count": len(diplomas),
-        },
-    }
+
+async def hydrate_via_api(
+    ini_ids: list[str],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Batch fetch full initiative details from Viriato API.
+
+    Calls GET /api/v3/iniciativas/batch?ids=... and maps the V3 response
+    to the shapes expected by research_assets table and build_research_prompt.
+
+    Returns (initiatives, votes, diplomas). Falls back to empty lists on error.
+    """
+    if not ini_ids:
+        return [], [], []
+
+    api_url = settings.viriato_api_url.rstrip("/")
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=VIRIATO_HYDRATE_TIMEOUT) as client:
+            resp = await client.get(
+                f"{api_url}/api/v3/iniciativas/batch",
+                params={"ids": ",".join(ini_ids)},
+            )
+            resp.raise_for_status()
+            items = resp.json()
+    except Exception:
+        logger.warning("Hydration failed for %d ini_ids", len(ini_ids), exc_info=True)
+        return [], [], []
+
+    duration = int((time.monotonic() - t0) * 1000)
+
+    initiatives = []
+    votes = []
+    diplomas = []
+
+    for item in items:
+        ini_id = item.get("iniId", "")
+
+        # Map to research_assets initiative shape
+        vote = item.get("latestVote") or {}
+        initiatives.append({
+            "ini_id": ini_id,
+            "title": item.get("title", ""),
+            "type_description": item.get("typeDescription", ""),
+            "party": (item.get("parties") or [""])[0],
+            "status": item.get("citizenStatus", {}).get("statusLabel", ""),
+            "legislature": "",  # Not in V3 response — acceptable, agent has context
+            "summary": item.get("summary"),
+            "vote_result": vote.get("result"),
+            "favor": vote.get("favor", []),
+            "contra": vote.get("contra", []),
+            "abstencao": vote.get("abstencao", []),
+            "vote_date": vote.get("date"),
+            "citizen_status": item.get("citizenStatus"),
+        })
+
+        # Map vote to votes list (for prompt context)
+        if vote:
+            votes.append({
+                "ini_id": ini_id,
+                "title": item.get("title", ""),
+                "party": (item.get("parties") or [""])[0],
+                "phase_name": vote.get("phase", ""),
+                "vote_date": vote.get("date"),
+                "resultado": vote.get("result", ""),
+                "favor": vote.get("favor", []),
+                "contra": vote.get("contra", []),
+                "abstencao": vote.get("abstencao", []),
+            })
+
+        # Map diplomas
+        for d in item.get("diplomas", []):
+            diplomas.append({
+                "tipo": d.get("tipo", ""),
+                "numero": d.get("numero"),
+                "titulo": d.get("titulo"),
+                "pub_date": d.get("pubDate"),
+                "ini_id": ini_id,
+            })
+
+    logger.info(
+        "Hydration: %d initiatives, %d votes, %d diplomas in %dms",
+        len(initiatives), len(votes), len(diplomas), duration,
+    )
+    return initiatives, votes, diplomas

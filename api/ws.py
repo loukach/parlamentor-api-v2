@@ -28,7 +28,7 @@ from api.orchestrator import (
     save_output,
     start_stage,
 )
-from api.prefetch import batch_fetch, expand_keywords
+from api.prefetch import semantic_search, hydrate_via_api
 from api.research import (
     DOSSIER_SCHEMA,
     build_research_prompt,
@@ -610,70 +610,45 @@ async def _handle_message(
 
             # Step 1: Pre-fetch data (first run or explicit re-fetch request)
             prefetch_data = None
-            kw_usage = None
             if is_first_run:
-                # Expand keywords with Haiku
+                # Semantic search via Viriato API
                 await _send(websocket, {
                     "type": "tool_call",
-                    "tool": "keyword_expansion",
-                    "summary": f"A expandir palavras-chave: {topic}",
+                    "tool": "semantic_search",
+                    "summary": "A pesquisar dados parlamentares",
                 })
-                keywords, kw_usage = await expand_keywords(topic)
+                ini_ids = await semantic_search(topic)
                 await _send(websocket, {
                     "type": "tool_result",
-                    "tool": "keyword_expansion",
-                    "summary": f"{len(keywords)} palavras-chave geradas",
-                    "row_count": len(keywords),
-                })
-
-                # Log keyword expansion cost
-                if kw_usage:
-                    await _send(websocket, {
-                        "type": "usage",
-                        "input_tokens": kw_usage["input_tokens"],
-                        "output_tokens": kw_usage["output_tokens"],
-                        "cache_read_tokens": 0,
-                        "cache_create_tokens": 0,
-                        "cost_usd": kw_usage["cost_usd"],
-                        "iteration": 0,
-                    })
-
-                if cancel_event.is_set():
-                    return
-
-                # Batch SQL fetch
-                await _send(websocket, {
-                    "type": "tool_call",
-                    "tool": "batch_fetch",
-                    "summary": "A recolher dados parlamentares",
-                })
-                prefetch_data = await batch_fetch(parla_session_factory, topic, keywords)
-                stats = prefetch_data["stats"]
-                await _send(websocket, {
-                    "type": "tool_result",
-                    "tool": "batch_fetch",
-                    "summary": (
-                        f"{stats['initiative_count']} iniciativas, "
-                        f"{stats['vote_count']} votacoes, "
-                        f"{stats['diploma_count']} diplomas"
-                    ),
-                    "row_count": stats["initiative_count"] + stats["vote_count"] + stats["diploma_count"],
+                    "tool": "semantic_search",
+                    "summary": f"{len(ini_ids)} iniciativas encontradas",
+                    "row_count": len(ini_ids),
                 })
 
                 if cancel_event.is_set():
                     return
 
-                # Hydrate research assets for panel display (immediate)
-                ini_ids = [r["ini_id"] for r in prefetch_data["initiatives"] if r.get("ini_id")]
+                # Hydrate full details via Viriato API + save for panel display
                 if ini_ids:
-                    async with parla_session_factory() as parla_db:
-                        hydrated_inis, hydrated_votes = await _hydrate_assets(parla_db, ini_ids)
-                    async with app_session_factory() as app_db2:
-                        await _upsert_research_assets(
-                            app_db2, investigation_id, hydrated_inis, hydrated_votes
-                        )
-                    # Notify frontend to refresh assets panel immediately
-                    await _send(websocket, {"type": "assets_updated"})
+                    hydrated_inis, hydrated_votes, diplomas = await hydrate_via_api(ini_ids)
+                    if hydrated_inis:
+                        async with app_session_factory() as app_db2:
+                            await _upsert_research_assets(
+                                app_db2, investigation_id, hydrated_inis, hydrated_votes
+                            )
+                        await _send(websocket, {"type": "assets_updated"})
+
+                    # Build prefetch_data for the research prompt
+                    prefetch_data = {
+                        "initiatives": hydrated_inis,
+                        "votes": hydrated_votes,
+                        "diplomas": diplomas,
+                        "stats": {
+                            "initiative_count": len(hydrated_inis),
+                            "vote_count": len(hydrated_votes),
+                            "diploma_count": len(diplomas),
+                        },
+                    }
 
             # Step 2: Build prompt with pre-fetched data
             system_prompt = await build_research_prompt(
@@ -728,29 +703,43 @@ async def _handle_message(
                         websocket, agent_gen, gate_requested_at_start=False
                     )
 
-                # Add keyword expansion usage to totals
-                if kw_usage:
-                    total_usage["input_tokens"] += kw_usage["input_tokens"]
-                    total_usage["output_tokens"] += kw_usage["output_tokens"]
-                    total_usage["cost_usd"] += kw_usage["cost_usd"]
+                # Validate research output — reject garbage/empty dossiers
+                if structured_output:
+                    summary = (structured_output.get("executive_summary") or "").strip()
+                    if len(summary) < 50:
+                        logger.warning(
+                            "Research output rejected: executive_summary too short (%d chars)",
+                            len(summary),
+                        )
+                        structured_output = None
+                        assistant_prose = (
+                            "Não foi possível produzir um dossier de investigação com os dados "
+                            "disponíveis. Os termos de pesquisa podem não ter encontrado "
+                            "iniciativas relevantes. Tente reformular o tópico ou envie uma "
+                            "mensagem com mais contexto para refinar a pesquisa."
+                        )
+                        await _send(websocket, {
+                            "type": "text_delta",
+                            "content": assistant_prose,
+                        })
 
                 if structured_output:
                     await save_output(app_db, investigation_id, current_stage, structured_output)
 
-                    # Update research assets from curated ini_ids
+                    # Update research assets from curated ini_ids (via API)
                     curated_ini_ids = [
                         ini["ini_id"]
                         for ini in structured_output.get("initiatives", [])
                         if ini.get("ini_id")
                     ]
                     if curated_ini_ids:
-                        async with parla_session_factory() as parla_db:
-                            inis, vts = await _hydrate_assets(parla_db, curated_ini_ids)
-                        async with app_session_factory() as app_db2:
-                            await _upsert_research_assets(
-                                app_db2, investigation_id, inis, vts
-                            )
-                        await _send(websocket, {"type": "assets_updated"})
+                        inis, vts, _ = await hydrate_via_api(curated_ini_ids)
+                        if inis:
+                            async with app_session_factory() as app_db2:
+                                await _upsert_research_assets(
+                                    app_db2, investigation_id, inis, vts
+                                )
+                            await _send(websocket, {"type": "assets_updated"})
 
                     await _send(websocket, {
                         "type": "stage_output",
@@ -921,6 +910,35 @@ async def _get_latest_feedback(
         )
         gate = result.scalar()
         return gate.feedback if gate else None
+
+
+async def _fetch_diplomas(parla_db, ini_ids: list[str]) -> list[dict]:
+    """Fetch diplomas linked to the given ini_ids from Parla DB."""
+    if not ini_ids:
+        return []
+    placeholders = ", ".join(f":id_{i}" for i in range(len(ini_ids)))
+    bind = {f"id_{i}": v for i, v in enumerate(ini_ids)}
+    sql = f"""
+        SELECT d.id, d.tipo, d.numero, d.titulo, d.pub_date,
+               di.ini_id
+        FROM diplomas d
+        JOIN diploma_iniciativas di ON di.diploma_id = d.id
+        WHERE di.ini_id IN ({placeholders})
+        ORDER BY d.pub_date DESC NULLS LAST
+    """
+    result = await parla_db.execute(text(sql), bind)
+    rows = result.mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "tipo": r["tipo"],
+            "numero": r["numero"],
+            "titulo": r["titulo"],
+            "pub_date": str(r["pub_date"]) if r["pub_date"] else None,
+            "ini_id": r["ini_id"],
+        }
+        for r in rows
+    ]
 
 
 async def _hydrate_assets(

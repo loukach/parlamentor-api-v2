@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     nhost_region: str = "eu-central-1"
     nhost_jwks_url: str = ""  # Override; default built from subdomain+region
 
+    # Viriato (Parla!) API for semantic search
+    viriato_api_url: str = "https://viriato-api.onrender.com"
+
     # CORS
     cors_origins: str = "http://localhost:5180,https://parlamentor-web.onrender.com"
 

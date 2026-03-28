@@ -49,6 +49,7 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 - **UUID primary keys.** All tables use `uuid4` defaults.
 - **JSONB for structured data.** Stage outputs, state snapshots, tool inputs/outputs.
 - **Langfuse SDK v3 direct.** `from langfuse import Langfuse`. Use `start_span()` and `start_observation(as_type='generation')`. NOT the OTEL path.
+- **Langfuse is the single source of truth for all agent prompts.** Prompts are fetched at runtime via `fetch_prompt()` with the `production` label. The `_FALLBACK_*` constants in `research.py`, `analysis.py`, `drafting.py`, and `prompts.py` exist only as resilience fallbacks — **never edit them to change prompt behavior**. To modify a prompt, create a new version in Langfuse and promote it to `production`.
 - **Anthropic structured output.** Use `output_config={"format": {"type": "json_schema", "schema": {...}}}`. Compatible with `thinking`.
 - **Cost calculation.** Backend-computed from token counts (Langfuse has cache token double-counting bug).
 - **Session-per-tool-call.** Each DB tool opens its own Parla session via factory (`async with parla_session_factory() as session`). Prevents SQL errors from poisoning subsequent queries on a shared transaction.
