@@ -17,6 +17,8 @@ FastAPI + SQLAlchemy async + asyncpg. Dual database pattern:
 - **App DB** (`parlamentor-db`): Read-write. Investigations, stages, outputs, logs.
 - **Parla! DB** (`viriato-postgres`): Read-only. Parliamentary data (initiatives, votes, speeches).
 
+Research prefetch uses the Viriato API (semantic search + batch hydration) instead of direct Parla DB queries. The Parla DB connection is still used by revision tools (`raw_query`, `describe_table`) and will be removed in a future phase.
+
 Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite). Langfuse SDK v3 for observability.
 
 ## Key Files
@@ -26,19 +28,22 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 | `api/config.py` | Pydantic Settings, URL normalization |
 | `api/db.py` | Dual async engines + session factories (Parla pool: `pool_pre_ping`, `pool_recycle=300`) |
 | `api/main.py` | FastAPI app, lifespan, CORS, health endpoint, WS router |
+| `api/auth.py` | Nhost JWT auth: `get_current_user` (HTTP dep), `validate_ws_token` (WebSocket), JWKS verification |
 | `api/models/__init__.py` | 9 SQLAlchemy models (Investigation, Stage, StageOutput, StateSnapshot, GateLog, AgentLog, Message, QueryLog, ResearchAssets) |
 | `api/routes.py` | REST endpoints (CRUD investigations, stages, messages, stage outputs, research assets) |
 | `api/schemas.py` | Pydantic request/response schemas |
 | `api/orchestrator.py` | State machine (3 stages), gate logic (research: simplified advance; analysis: approve/revise/reject), cost logging |
 | `api/executor.py` | Agent loop (async generator), streaming, tool dispatch, structured extraction, server tool support |
 | `api/prefetch.py` | Pre-fetch pipeline: Viriato API semantic search + batch hydration (no direct DB access) |
+| `api/prompts.py` | Langfuse prompt management: `fetch_prompt()` (production label), `get_identity()`, `_FALLBACK_*` resilience constants |
 | `api/research.py` | Research analyst config: system prompt, DossierOutput schema (with diplomas, media_signals) |
 | `api/analysis.py` | Analysis config: merged findings + story angles, AnalysisOutput schema |
-| `api/drafting.py` | Drafting config: Opus skill mode, DraftOutput schema, chat-based iteration |
+| `api/drafting.py` | Drafting config: skill mode (model via UI picker; default Sonnet 4.6), DraftOutput schema, chat-based iteration |
 | `api/tools.py` | DB tools + registries: `build_tool_registry` (all 6), `build_research_tool_registry` (escape hatch: raw_query, describe_table, request_gate_review) |
 | `api/ws.py` | WebSocket endpoint `/ws/chat/{id}`: message handling, gate decisions, prefetch, 3 stage handlers, `assets_updated` event |
 | `api/costs.py` | Anthropic pricing table, cost calculation with cache pricing |
 | `api/tracing.py` | Langfuse TraceContext: span/generation/tool call logging |
+| `api/email.py` | Resend email sending (share artifacts via branded template) |
 | `scripts/validate_architecture.py` | 5 validation tests (structured output, caching, Langfuse, extraction, tools) |
 | `scripts/seed.py` | Test data seeder |
 
@@ -53,6 +58,7 @@ Pydantic Settings for config. Alembic for migrations (PostgreSQL only, no SQLite
 - **Anthropic structured output.** Use `output_config={"format": {"type": "json_schema", "schema": {...}}}`. Compatible with `thinking`.
 - **Cost calculation.** Backend-computed from token counts (Langfuse has cache token double-counting bug).
 - **Session-per-tool-call.** Each DB tool opens its own Parla session via factory (`async with parla_session_factory() as session`). Prevents SQL errors from poisoning subsequent queries on a shared transaction.
+- **Viriato API for research data.** The research prefetch pipeline (`prefetch.py`) calls `semantic_search()` and `hydrate_via_api()` — both HTTP calls to the Viriato API. No direct Parla DB access in the research handler. Config: `viriato_api_url` (default: `https://viriato-api.onrender.com`).
 
 ## Database
 
