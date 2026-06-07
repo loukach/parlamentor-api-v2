@@ -31,10 +31,6 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
-    # Stage-specific model overrides (optional)
-    analysis_model: str = ""  # Defaults to Sonnet 4.6 if not set
-    drafting_model: str = ""  # Defaults to Opus 4.6 if not set
-
     # Nhost
     nhost_subdomain: str = ""
     nhost_region: str = "eu-central-1"

@@ -35,13 +35,11 @@ from api.research import (
 )
 from api.analysis import (
     ANALYSIS_SCHEMA,
-    ANALYSIS_MODEL,
     ANALYSIS_THINKING,
     build_analysis_prompt,
 )
 from api.drafting import (
     DRAFT_SCHEMA,
-    DRAFTING_MODEL,
     DRAFTING_THINKING,
     build_drafting_prompt,
 )
@@ -342,7 +340,7 @@ async def _run_analysis_stage(
     # Run agent in skill mode (single call, no tools)
     async with app_session_factory() as app_db:
         agent_gen = run_agent(
-            model=ANALYSIS_MODEL,
+            model=model,
             system_prompt=system_prompt,
             messages=await _load_conversation(app_db, investigation_id, "analysis"),
             tools=[],
@@ -413,6 +411,7 @@ async def _run_drafting_stage(
     websocket: WebSocket,
     investigation_id: uuid.UUID,
     user_feedback: str,
+    model: str,
     cancel_event: asyncio.Event,
     trace: TraceContext,
 ) -> tuple[dict, str]:
@@ -478,7 +477,7 @@ async def _run_drafting_stage(
     # Run Opus in skill mode (no tools, single call)
     async with app_session_factory() as app_db:
         agent_gen = run_agent(
-            model=DRAFTING_MODEL,
+            model=model,
             system_prompt=system_prompt,
             messages=[{"role": "user", "content": "Write the article." if is_first_draft else user_feedback}],
             tools=[],
@@ -528,7 +527,7 @@ async def _run_drafting_stage(
                     stage="drafting",
                     role="assistant",
                     content=assistant_text,
-                    metadata_={"model": DRAFTING_MODEL, "usage": total_usage},
+                    metadata_={"model": model, "usage": total_usage},
                 )
                 app_db2.add(assistant_msg)
                 await app_db2.commit()
@@ -539,7 +538,7 @@ async def _run_drafting_stage(
                 app_db2,
                 investigation_id,
                 "drafting",
-                DRAFTING_MODEL,
+                model,
                 **{k: v for k, v in total_usage.items() if k != "cost_usd"},
             )
 
@@ -665,7 +664,7 @@ async def _handle_message(
                         messages=messages,
                         tools=[],
                         tool_handlers={},
-                        thinking={"type": "enabled", "budget_tokens": 10000},
+                        thinking={"type": "adaptive"},
                         output_schema=DOSSIER_SCHEMA["schema"],
                         cancel_event=cancel_event,
                         trace=trace,
@@ -693,7 +692,7 @@ async def _handle_message(
                         messages=messages,
                         tools=tool_defs,
                         tool_handlers=tool_handlers,
-                        thinking={"type": "enabled", "budget_tokens": 10000},
+                        thinking={"type": "adaptive"},
                         output_schema=DOSSIER_SCHEMA["schema"],
                         cancel_event=cancel_event,
                         trace=trace,
@@ -804,7 +803,7 @@ async def _handle_message(
 
         elif current_stage == "drafting":
             total_usage, trace_out = await _run_drafting_stage(
-                websocket, investigation_id, content, cancel_event, trace
+                websocket, investigation_id, content, model, cancel_event, trace
             )
             trace_output = trace_out
 

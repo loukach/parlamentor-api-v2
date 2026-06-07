@@ -1,7 +1,7 @@
-"""Drafting stage configuration: prompt, DraftOutput schema, Opus 4.6.
+"""Drafting stage configuration: prompt, DraftOutput schema, skill mode.
 
 Drafting is chat-based iteration:
-- Each message (feedback) → single Opus call → complete DraftOutput
+- Each message (feedback) → single model call → complete DraftOutput
 - Agent receives: angle + DossierOutput + previous draft + feedback → new draft
 - No gate. save_output(set_gate_pending=False) saves each version.
 """
@@ -9,15 +9,13 @@ Drafting is chat-based iteration:
 import json
 import logging
 
-from api.config import settings
 from api.prompts import fetch_prompt, get_identity
 
 logger = logging.getLogger(__name__)
 
 _PROMPT_INSTRUCTIONS = "parlamentor-v2-drafting-instructions"
 
-DRAFTING_MODEL = settings.drafting_model or "claude-opus-4-6"
-DRAFTING_THINKING = {"type": "enabled", "budget_tokens": 10000}
+DRAFTING_THINKING = {"type": "adaptive"}
 
 # Fallback instructions (>= 1024 tokens for caching)
 _FALLBACK_INSTRUCTIONS = """\

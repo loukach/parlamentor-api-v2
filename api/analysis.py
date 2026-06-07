@@ -8,7 +8,6 @@ Merges previous Analysis + Editorial into a single skill-mode call.
 import json
 import logging
 
-from api.config import settings
 from api.prompts import fetch_prompt, get_identity
 
 logger = logging.getLogger(__name__)
@@ -107,8 +106,7 @@ Before calling request_gate_review, verify:
 - [ ] Executive summary captures the key insights\
 """
 
-ANALYSIS_MODEL = settings.analysis_model or "claude-sonnet-4-6"
-ANALYSIS_THINKING = {"type": "enabled", "budget_tokens": 16000}
+ANALYSIS_THINKING = {"type": "adaptive"}
 
 
 async def build_analysis_prompt(
