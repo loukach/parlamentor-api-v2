@@ -19,6 +19,19 @@ VIRIATO_SEARCH_TIMEOUT = 8.0  # seconds — can be slow on cold start
 VIRIATO_HYDRATE_TIMEOUT = 10.0
 
 
+def _diff_if_meaningful(diff: dict | None) -> dict | None:
+    """Keep the proposal->law diff only when it represents a real change.
+
+    Viriato returns changesVsInitial for every valid verdict, including
+    `essentially_same` (formal/DAPLEN tweaks only). Drop those — noise for the
+    analyst and the UI. This is the single gate; everything downstream just
+    checks truthiness.
+    """
+    if not diff or diff.get("verdict") == "essentially_same":
+        return None
+    return diff
+
+
 async def semantic_search(topic: str) -> list[str]:
     """Call Viriato /api/search for embedding-based initiative discovery.
 
@@ -117,6 +130,9 @@ async def hydrate_via_api(
             "abstencao": vote.get("abstencao", []),
             "vote_date": vote.get("date"),
             "citizen_status": item.get("citizenStatus"),
+            # Initiative enrichment (Phase 6): pass viriato objects through unchanged
+            "impact_card": item.get("impactCard"),
+            "changes_vs_initial": _diff_if_meaningful(item.get("changesVsInitial")),
         })
 
         # Map vote to votes list (for prompt context)
