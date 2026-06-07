@@ -84,12 +84,9 @@ def test_a():
     """Can we use output_config.format AND thinking in the same API call?"""
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=4000,
-            thinking={
-                "type": "enabled",
-                "budget_tokens": 2000,
-            },
+            thinking={"type": "adaptive"},
             messages=[
                 {"role": "user", "content": "List 2 facts about Portugal's parliament."}
             ],
@@ -129,7 +126,7 @@ def test_b():
 
         # First call: creates cache
         r1 = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=50,
             system=system_prompt,
             messages=[{"role": "user", "content": "Say 'hello'."}],
@@ -138,7 +135,7 @@ def test_b():
 
         # Second call: should read from cache
         r2 = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=50,
             system=system_prompt,
             messages=[{"role": "user", "content": "Say 'world'."}],
@@ -170,7 +167,7 @@ def test_c():
         generation = lf.start_observation(
             as_type="generation",
             name="test-generation",
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             input=[{"role": "user", "content": "test"}],
             output="test response",
             usage_details={
@@ -210,7 +207,7 @@ def test_d():
 
         # Turn 1: agent responds freely
         r1 = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             messages=messages,
         )
@@ -220,7 +217,7 @@ def test_d():
         # Turn 2: user follow-up
         messages.append({"role": "user", "content": "What are their ideologies?"})
         r2 = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             messages=messages,
         )
@@ -236,7 +233,7 @@ def test_d():
         )
 
         r3 = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=500,
             messages=messages,
             output_config={"format": PARTIES_SCHEMA},
@@ -289,7 +286,7 @@ def test_e():
         ]
 
         response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             tools=tools,
             messages=[

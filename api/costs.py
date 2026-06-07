@@ -9,6 +9,10 @@ from decimal import Decimal
 # Pricing per million tokens (USD) — updated 2026-03-18
 # Source: https://platform.claude.com/docs/en/about-claude/pricing
 PRICING: dict[str, dict[str, Decimal]] = {
+    "claude-opus-4-8": {
+        "input": Decimal("5.00"),
+        "output": Decimal("25.00"),
+    },
     "claude-opus-4-6": {
         "input": Decimal("5.00"),
         "output": Decimal("25.00"),
