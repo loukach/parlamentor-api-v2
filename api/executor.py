@@ -42,6 +42,7 @@ async def run_agent(
     tools: list[dict],
     tool_handlers: dict[str, callable],
     thinking: dict | None = None,
+    effort: str = "medium",
     output_schema: dict | None = None,
     cancel_event: asyncio.Event,
     trace: TraceContext | None = None,
@@ -88,6 +89,9 @@ async def run_agent(
             "system": system_prompt,
             "messages": messages,
             "tools": all_tools,
+            # Cap adaptive-thinking depth/spend; default is "high" which can
+            # over-think and crowd the structured JSON out of max_tokens.
+            "output_config": {"effort": effort},
         }
         if thinking:
             api_kwargs["thinking"] = thinking
@@ -95,8 +99,9 @@ async def run_agent(
         # If gate was requested, add structured output and remove tools
         # so the model can only produce text (the structured JSON)
         if gate_requested and output_schema:
-            api_kwargs["output_config"] = {
-                "format": {"type": "json_schema", "schema": output_schema}
+            api_kwargs["output_config"]["format"] = {
+                "type": "json_schema",
+                "schema": output_schema,
             }
             api_kwargs.pop("tools", None)
 
